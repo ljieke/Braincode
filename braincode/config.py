@@ -146,6 +146,15 @@ class RecoveryConfig:
 
 
 @dataclass
+class SchedulerConfig:
+    enabled: bool = False
+    timezone: str = "UTC"
+    poll_interval_seconds: float = 1.0
+    default_misfire_policy: str = "skip"
+    default_overlap_policy: str = "coalesce"
+
+
+@dataclass
 class AppConfig:
     providers: list[ProviderConfig]
     permission_mode: str = "default"
@@ -158,6 +167,7 @@ class AppConfig:
     enable_coordinator_mode: bool = False
     sandbox: SandboxAppConfig = field(default_factory=SandboxAppConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
 
 def _load_single_file(path: Path) -> AppConfig:
@@ -216,6 +226,14 @@ def _load_single_file(path: Path) -> AppConfig:
         max_output_continuations=recovery["max_output_continuations"],
         fallback_providers=list(recovery["fallback_providers"]),
     )
+    scheduler = validated["scheduler"]
+    scheduler_cfg = SchedulerConfig(
+        enabled=scheduler["enabled"],
+        timezone=scheduler["timezone"],
+        poll_interval_seconds=scheduler["poll_interval_seconds"],
+        default_misfire_policy=scheduler["default_misfire_policy"],
+        default_overlap_policy=scheduler["default_overlap_policy"],
+    )
 
     return AppConfig(
         providers=providers,
@@ -229,6 +247,7 @@ def _load_single_file(path: Path) -> AppConfig:
         enable_coordinator_mode=validated["enable_coordinator_mode"],
         sandbox=sandbox_cfg,
         recovery=recovery_cfg,
+        scheduler=scheduler_cfg,
     )
 
 
@@ -265,6 +284,8 @@ def _merge_config(base: AppConfig, override: AppConfig) -> AppConfig:
         base.sandbox.network_enabled = True
     if override.recovery != RecoveryConfig():
         base.recovery = override.recovery
+    if override.scheduler != SchedulerConfig():
+        base.scheduler = override.scheduler
     return base
 
 

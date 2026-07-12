@@ -44,7 +44,13 @@ from braincode.client import create_client, resolve_context_window
 from braincode.commands import CommandContext, CommandRegistry, CommandType
 from braincode.commands.handlers import register_all_commands
 from braincode.commands.parser import parse_command
-from braincode.config import MCPServerConfig, ProviderConfig, RecoveryConfig
+from braincode.config import (
+    MCPServerConfig,
+    ProviderConfig,
+    RecoveryConfig,
+    SandboxAppConfig,
+    SchedulerConfig,
+)
 from braincode.conversation import ConversationManager
 from braincode.hooks import HookEngine
 from braincode.mcp import MCPManager
@@ -77,6 +83,8 @@ class RemoteServer:
         addr: str = "0.0.0.0",
         port: int = 18888,
         recovery_config: RecoveryConfig | None = None,
+        scheduler_config: SchedulerConfig | None = None,
+        sandbox_config: SandboxAppConfig | None = None,
     ) -> None:
         self.providers = providers
         self._mcp_server_configs = mcp_servers or []
@@ -84,6 +92,8 @@ class RemoteServer:
         self.addr = addr
         self.port = port
         self._recovery_config = recovery_config or RecoveryConfig()
+        self._scheduler_config = scheduler_config or SchedulerConfig()
+        self._sandbox_config = sandbox_config or SandboxAppConfig()
 
         # WebSocket 连接池（支持多客户端广播）
         self._connections: set[ServerConnection] = set()
@@ -114,6 +124,10 @@ class RemoteServer:
         self.memory_manager: MemoryManager | None = None
         self.session_manager: SessionManager | None = None
         self.session: Session | None = None
+        self.job_manager = None
+        self.scheduler = None
+        self.tool_job_runner = None
+        self.prompt_job_runner = None
 
     # ------------------------------------------------------------------
     # 启动入口
@@ -130,15 +144,24 @@ class RemoteServer:
         print(f"\n  Remote UI: http://localhost:{self.port}\n")
 
         # websockets 的 serve 支持 process_request 回调来处理普通 HTTP
-        async with websockets.serve(
-            self._ws_handler,
-            self.addr,
-            self.port,
-            process_request=self._process_http_request,
-            max_size=4 * 1024 * 1024,  # 4MB 消息上限
-        ):
-            # 服务器启动后永久阻塞
-            await asyncio.Future()
+        try:
+            async with websockets.serve(
+                self._ws_handler,
+                self.addr,
+                self.port,
+                process_request=self._process_http_request,
+                max_size=4 * 1024 * 1024,
+            ):
+                await asyncio.Future()
+        finally:
+            if self.scheduler is not None:
+                await self.scheduler.stop()
+            if self.tool_job_runner is not None:
+                await self.tool_job_runner.stop()
+            if self.prompt_job_runner is not None:
+                await self.prompt_job_runner.stop()
+            if self.mcp_manager is not None:
+                await self.mcp_manager.shutdown()
 
     # ------------------------------------------------------------------
     # HTTP 请求处理（为 / 路径提供前端 HTML）
@@ -237,6 +260,9 @@ class RemoteServer:
                 local_rules_path=Path(work_dir) / ".braincode" / "permissions.local.yaml",
             ),
             mode=PermissionMode.DEFAULT,
+            sandbox_enabled=(
+                self._sandbox_config.enabled and self._sandbox_config.auto_allow
+            ),
         )
 
         # 加载自定义指令和记忆
@@ -253,6 +279,22 @@ class RemoteServer:
         # 工具注册表
         self.registry = create_default_registry()
         self.registry.register(ToolSearchTool(self.registry, protocol=provider.protocol))
+        bash_tool = self.registry.get("Bash")
+        if bash_tool is not None:
+            bash_tool.work_dir = work_dir
+        if self._sandbox_config.enabled and bash_tool is not None:
+            from braincode.sandbox import SandboxConfig, create_sandbox
+            os_sandbox = create_sandbox()
+            if os_sandbox and os_sandbox.available():
+                bash_tool.sandbox = os_sandbox
+                bash_tool.sandbox_config = SandboxConfig(
+                    allow_write=[work_dir, "/tmp"],
+                    deny_write=[
+                        f"{work_dir}/.braincode/config.yaml",
+                        f"{work_dir}/.braincode/permissions.local.yaml",
+                    ],
+                    network_enabled=self._sandbox_config.network_enabled,
+                )
 
         # Skill 加载
         self.skill_loader = SkillLoader(work_dir)
@@ -276,6 +318,102 @@ class RemoteServer:
             ),
         )
         self.agent.session_id = self.session_id
+
+        from braincode.jobs import (
+            BackgroundToolRunner,
+            JobKind,
+            JobManager,
+            MisfirePolicy,
+            OverlapPolicy,
+            PromptJobRunner,
+            SchedulerService,
+        )
+        from braincode.tools.job_tools import (
+            CronCreateTool,
+            CronDeleteTool,
+            CronListTool,
+            JobCancelTool,
+            JobCreateTool,
+            JobGetTool,
+            JobListTool,
+        )
+
+        self.job_manager = JobManager.for_project(work_dir)
+        self.tool_job_runner = BackgroundToolRunner(
+            self.job_manager, self.registry, checker, work_dir=work_dir
+        )
+
+        async def run_scheduled_prompt(job, prompt: str) -> str:
+            scheduled_client = create_client(provider)
+            scheduled_session = self.session_manager.create()
+            scheduled_registry = ToolRegistry()
+            for scheduled_tool in self.registry.list_tools():
+                if scheduled_tool.name != "AskUserQuestion":
+                    scheduled_registry.register(scheduled_tool)
+            scheduled_agent = Agent(
+                client=scheduled_client,
+                registry=scheduled_registry,
+                protocol=provider.protocol,
+                work_dir=job.worktree_path or work_dir,
+                permission_checker=checker,
+                context_window=provider.get_context_window(),
+                instructions_content=instructions,
+                memory_manager=self.memory_manager,
+                hook_engine=self.hook_engine,
+                recovery_controller=build_recovery_controller(
+                    scheduled_client, self.providers, self._recovery_config
+                ),
+            )
+            scheduled_agent.session_id = scheduled_session.session_id
+            try:
+                return await scheduled_agent.run_to_completion(prompt)
+            finally:
+                scheduled_session.close()
+
+        self.prompt_job_runner = PromptJobRunner(
+            self.job_manager,
+            run_scheduled_prompt,
+            output_dir=Path(work_dir) / ".braincode" / "job-output",
+        )
+
+        def dispatch_scheduled_job(job) -> None:
+            if job.kind == JobKind.TOOL:
+                self.tool_job_runner.submit_job(job)
+            elif job.kind == JobKind.PROMPT:
+                self.prompt_job_runner.submit_job(job)
+
+        self.scheduler = SchedulerService(
+            self.job_manager.store,
+            poll_interval_seconds=self._scheduler_config.poll_interval_seconds,
+            on_job_created=dispatch_scheduled_job,
+            default_timezone=self._scheduler_config.timezone,
+            default_misfire_policy=MisfirePolicy(
+                self._scheduler_config.default_misfire_policy
+            ),
+            default_overlap_policy=OverlapPolicy(
+                self._scheduler_config.default_overlap_policy
+            ),
+        )
+        if bash_tool is not None:
+            bash_tool.background_runner = self.tool_job_runner
+        for job_tool in (
+            JobCreateTool(
+                self.job_manager, self.tool_job_runner, self.prompt_job_runner
+            ),
+            JobGetTool(self.job_manager),
+            JobListTool(self.job_manager),
+            JobCancelTool(
+                self.job_manager, self.tool_job_runner, self.prompt_job_runner
+            ),
+            CronCreateTool(self.scheduler, self.tool_job_runner),
+            CronListTool(self.scheduler),
+            CronDeleteTool(self.scheduler),
+        ):
+            self.registry.register(job_tool)
+        self.tool_job_runner.start_pending()
+        self.prompt_job_runner.start_pending()
+        if self._scheduler_config.enabled:
+            self.scheduler.start()
 
         # 连接 Skill 到 Agent
         load_skill_tool.set_loader(self.skill_loader)

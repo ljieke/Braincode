@@ -10,7 +10,7 @@ from braincode.hooks.conditions import (
     ConditionParseError,
     parse_condition,
 )
-from braincode.hooks.engine import HookEngine
+from braincode.hooks.engine import HookEngine, merge_hook_results, parse_hook_result
 from braincode.hooks.events import LifecycleEvent
 from braincode.hooks.loader import HookConfigError, load_hooks
 from braincode.hooks.models import (
@@ -18,6 +18,7 @@ from braincode.hooks.models import (
     ActionResult,
     Hook,
     HookContext,
+    HookResult,
     ToolRejectedError,
 )
 
@@ -32,9 +33,11 @@ __all__ = [
     "HookConfigError",
     "HookContext",
     "HookEngine",
+    "HookResult",
     "LifecycleEvent",
     "ToolRejectedError",
     "load_hooks",
+    "merge_hook_results",
+    "parse_hook_result",
     "parse_condition",
 ]
-

@@ -23,6 +23,7 @@ from braincode.hooks import (
     HookConfigError,
     HookContext,
     HookEngine,
+    HookResult,
     LifecycleEvent,
     ToolRejectedError,
     load_hooks,
@@ -34,8 +35,8 @@ from braincode.hooks import (
 # ---------------------------------------------------------------------------
 
 class TestLifecycleEvent:
-    def test_has_15_events(self):
-        assert len(LifecycleEvent) == 15
+    def test_has_17_events(self):
+        assert len(LifecycleEvent) == 17
 
     def test_string_comparison(self):
         assert LifecycleEvent.SESSION_START == "session_start"
@@ -50,6 +51,7 @@ class TestLifecycleEvent:
             "pre_send", "post_receive",
             "startup", "shutdown", "error", "compact",
             "permission_request", "file_change", "command_execute",
+            "user_prompt_submit", "stop",
         }
         assert {e.value for e in LifecycleEvent} == expected
 
@@ -85,14 +87,16 @@ class TestHookContext:
             file_path="src/main.py",
             message="done",
             error="",
+            tool_output="written",
         )
-        template = "Event=$EVENT Tool=$TOOL_NAME File=$FILE_PATH Msg=$MESSAGE Err=$ERROR Arg=$TOOL_ARGS.file_path"
+        template = "Event=$EVENT Tool=$TOOL_NAME File=$FILE_PATH Msg=$MESSAGE Err=$ERROR Out=$TOOL_OUTPUT Arg=$TOOL_ARGS.file_path"
         result = ctx.expand(template)
         assert "Event=post_tool_use" in result
         assert "Tool=WriteFile" in result
         assert "File=src/main.py" in result
         assert "Msg=done" in result
         assert "Err=" in result
+        assert "Out=written" in result
         assert "Arg=src/main.py" in result
 
     def test_expand_undefined_variable(self):
@@ -368,13 +372,43 @@ class TestLoadHooks:
                 "reject": True,
             }])
 
-    def test_async_on_pre_tool_use(self):
-        with pytest.raises(HookConfigError, match="async.*pre_tool_use"):
+    def test_async_pre_tool_notification_is_allowed(self):
+        hooks = load_hooks([{
+            "event": "pre_tool_use",
+            "action": {"type": "command", "command": "echo observed"},
+            "async": True,
+        }])
+        assert hooks[0].async_exec is True
+
+    def test_async_hook_cannot_modify_current_invocation(self):
+        with pytest.raises(HookConfigError, match="async hooks may only"):
             load_hooks([{
                 "event": "pre_tool_use",
-                "action": {"type": "command", "command": "x"},
+                "action": {"type": "command", "command": "echo observed"},
                 "async": True,
+                "result": {"updated_args": {"command": "changed"}},
             }])
+
+    def test_async_hook_cannot_use_legacy_reject(self):
+        with pytest.raises(HookConfigError, match="cannot reject"):
+            load_hooks([{
+                "event": "pre_tool_use",
+                "action": {"type": "command", "command": "echo observed"},
+                "async": True,
+                "reject": True,
+            }])
+
+    def test_structured_result_config(self):
+        hooks = load_hooks([{
+            "event": "post_tool_use",
+            "action": {"type": "prompt", "message": "observed"},
+            "result": {
+                "updated_output": "rewritten $TOOL_OUTPUT",
+                "additional_context": "remember $TOOL_NAME",
+            },
+        }])
+        assert hooks[0].configured_result is not None
+        assert hooks[0].configured_result.updated_output == "rewritten $TOOL_OUTPUT"
 
     def test_missing_required_field(self):
         with pytest.raises(HookConfigError, match="requires.*command"):
@@ -508,6 +542,81 @@ class TestHookEngine:
         # 给异步任务一点时间完成
         await asyncio.sleep(0.1)
 
+    @pytest.mark.asyncio
+    async def test_structured_results_merge_in_hook_order(self):
+        first = self._make_hook(
+            id="first",
+            event="pre_tool_use",
+            action=Action(type="prompt", message="first"),
+            configured_result=HookResult(
+                updated_args={"command": "first", "keep": True},
+                additional_context="context one",
+            ),
+        )
+        second = self._make_hook(
+            id="second",
+            event="pre_tool_use",
+            action=Action(type="prompt", message="second"),
+            configured_result=HookResult(
+                updated_args={"command": "second"},
+                additional_context="context two",
+            ),
+        )
+        engine = HookEngine([first, second])
+
+        result = await engine.run_hooks(
+            "pre_tool_use",
+            HookContext(event_name="pre_tool_use", tool_name="Bash"),
+        )
+
+        assert result.updated_args == {"command": "second", "keep": True}
+        assert result.additional_context == "context one\ncontext two"
+        assert engine.drain_additional_contexts() == ["context one", "context two"]
+
+    @pytest.mark.asyncio
+    async def test_reject_stops_later_side_effect_hooks(self):
+        rejecting = self._make_hook(
+            id="rejecting",
+            event="pre_tool_use",
+            action=Action(type="prompt", message="blocked"),
+            configured_result=HookResult(
+                outcome="reject", reject_reason="policy"
+            ),
+        )
+        later = self._make_hook(
+            id="later",
+            event="pre_tool_use",
+            action=Action(type="prompt", message="must not run"),
+        )
+        engine = HookEngine([rejecting, later])
+
+        result = await engine.run_hooks(
+            "pre_tool_use", HookContext(event_name="pre_tool_use")
+        )
+
+        assert result.is_rejected
+        assert result.reject_reason == "policy"
+        assert rejecting.executed is True
+        assert later.executed is False
+
+    @pytest.mark.asyncio
+    async def test_command_output_can_return_structured_result(self):
+        hook = self._make_hook(
+            event="post_tool_use",
+            action=Action(
+                type="prompt",
+                message='{"updated_output":"sanitized","additional_context":"next"}',
+            ),
+        )
+        engine = HookEngine([hook])
+
+        result = await engine.run_hooks(
+            "post_tool_use", HookContext(event_name="post_tool_use")
+        )
+
+        assert result.updated_output == "sanitized"
+        assert result.additional_context == "next"
+
 # ---------------------------------------------------------------------------
 # Agent 循环集成
 # ---------------------------------------------------------------------------
@@ -596,3 +705,209 @@ class TestAgentHookIntegration:
         assert rejected.is_error is True
         assert "Hook rejected" in rejected.output
         assert executed["value"] is False
+
+    @pytest.mark.asyncio
+    async def test_post_hook_rewrites_output_and_injects_next_context(self):
+        from braincode.agent import Agent
+        from braincode.client import LLMClient
+        from braincode.conversation import ConversationManager
+        from braincode.tools import create_default_registry
+        from braincode.tools.base import StreamEnd, TextDelta, ToolCallComplete
+
+        observed = {"output": False, "context": False}
+
+        class MockClient(LLMClient):
+            def __init__(self):
+                self._call = 0
+
+            async def stream(self, conversation, system="", tools=None):
+                self._call += 1
+                if self._call == 1:
+                    yield ToolCallComplete(
+                        tool_id="t1",
+                        tool_name="Bash",
+                        arguments={"command": "echo raw"},
+                    )
+                    yield StreamEnd("tool_use", input_tokens=1, output_tokens=1)
+                    return
+                messages = conversation.get_messages()
+                observed["output"] = any(
+                    result.content == "sanitized"
+                    for message in messages
+                    for result in message.tool_results
+                )
+                observed["context"] = any(
+                    "post hook context" in message.content for message in messages
+                )
+                yield TextDelta("done")
+                yield StreamEnd("end_turn", input_tokens=1, output_tokens=1)
+
+        hook = Hook(
+            id="sanitize",
+            event="post_tool_use",
+            action=Action(type="prompt", message="observed"),
+            configured_result=HookResult(
+                updated_output="sanitized",
+                additional_context="post hook context",
+            ),
+        )
+        conversation = ConversationManager()
+        conversation.add_user_message("run it")
+        agent = Agent(
+            client=MockClient(),
+            registry=create_default_registry(),
+            protocol="anthropic",
+            hook_engine=HookEngine([hook]),
+        )
+
+        async for _ in agent.run(conversation):
+            pass
+
+        assert observed == {"output": True, "context": True}
+
+    @pytest.mark.asyncio
+    async def test_modified_args_are_rechecked_by_permission_checker(self):
+        from braincode.agent import Agent
+        from braincode.client import LLMClient
+        from braincode.permissions import Decision, PermissionMode
+        from braincode.tools import create_default_registry
+        from braincode.tools.base import ToolCallComplete
+
+        class Checker:
+            mode = PermissionMode.DEFAULT
+
+            def __init__(self):
+                self.seen: list[str] = []
+
+            def check(self, tool, arguments):
+                command = str(arguments.get("command", ""))
+                self.seen.append(command)
+                if command == "blocked-final-command":
+                    return Decision(effect="deny", reason="final args denied")
+                return Decision(effect="allow", reason="safe")
+
+        class MockClient(LLMClient):
+            async def stream(self, conversation, system="", tools=None):
+                if False:
+                    yield None
+
+        checker = Checker()
+        hook = Hook(
+            id="mutate",
+            event="pre_tool_use",
+            action=Action(type="prompt", message="mutating"),
+            configured_result=HookResult(
+                updated_args={"command": "blocked-final-command"}
+            ),
+        )
+        agent = Agent(
+            client=MockClient(),
+            registry=create_default_registry(),
+            protocol="anthropic",
+            permission_checker=checker,
+            hook_engine=HookEngine([hook]),
+        )
+
+        result = await agent._execute_tool_noninteractive(
+            ToolCallComplete("t1", "Bash", {"command": "echo safe"})
+        )
+
+        assert result.is_error is True
+        assert "final args denied" in result.output
+        assert checker.seen[-1] == "blocked-final-command"
+
+    @pytest.mark.asyncio
+    async def test_permission_request_hook_can_modify_then_revalidate(self):
+        from braincode.agent import Agent
+        from braincode.client import LLMClient
+        from braincode.permissions import Decision, PermissionMode
+        from braincode.tools import create_default_registry
+        from braincode.tools.base import ToolCallComplete
+
+        class Checker:
+            mode = PermissionMode.DEFAULT
+
+            def __init__(self):
+                self.seen: list[str] = []
+
+            def check(self, tool, arguments):
+                command = str(arguments.get("command", ""))
+                self.seen.append(command)
+                if command == "echo approved":
+                    return Decision(effect="allow", reason="rewritten safely")
+                return Decision(effect="ask", reason="confirmation required")
+
+        class MockClient(LLMClient):
+            async def stream(self, conversation, system="", tools=None):
+                if False:
+                    yield None
+
+        checker = Checker()
+        hook = Hook(
+            id="approve-safe-form",
+            event="permission_request",
+            action=Action(type="prompt", message="rewriting"),
+            configured_result=HookResult(
+                updated_args={"command": "echo approved"}
+            ),
+        )
+        agent = Agent(
+            client=MockClient(),
+            registry=create_default_registry(),
+            protocol="anthropic",
+            permission_checker=checker,
+            hook_engine=HookEngine([hook]),
+        )
+
+        result = await agent._execute_tool_noninteractive(
+            ToolCallComplete("t1", "Bash", {"command": "npm install package"})
+        )
+
+        assert result.is_error is False
+        assert "approved" in result.output
+        assert checker.seen == ["npm install package", "echo approved"]
+
+    @pytest.mark.asyncio
+    async def test_run_to_completion_has_full_lifecycle_parity(self):
+        from braincode.agent import Agent
+        from braincode.client import LLMClient
+        from braincode.tools import create_default_registry
+        from braincode.tools.base import StreamEnd, TextDelta
+
+        class MockClient(LLMClient):
+            async def stream(self, conversation, system="", tools=None):
+                yield TextDelta("done")
+                yield StreamEnd("end_turn", input_tokens=1, output_tokens=1)
+
+        class RecordingHookEngine(HookEngine):
+            def __init__(self):
+                super().__init__([])
+                self.events: list[str] = []
+
+            async def run_hooks(self, event, ctx):
+                self.events.append(event)
+                if event == "post_receive":
+                    return HookResult(updated_output="rewritten")
+                return HookResult()
+
+        engine = RecordingHookEngine()
+        agent = Agent(
+            client=MockClient(),
+            registry=create_default_registry(),
+            protocol="anthropic",
+            hook_engine=engine,
+        )
+
+        result = await agent.run_to_completion("finish")
+
+        assert result == "rewritten"
+        assert engine.events == [
+            "user_prompt_submit",
+            "session_start",
+            "turn_start",
+            "pre_send",
+            "post_receive",
+            "turn_end",
+            "stop",
+            "session_end",
+        ]

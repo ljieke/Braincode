@@ -39,8 +39,7 @@ from braincode.permissions import (
     PermissionChecker,
     PermissionMode,
 )
-from braincode.hooks import HookContext, HookEngine, ToolRejectedError
-from braincode.hooks.engine import HookNotification
+from braincode.hooks import HookContext, HookEngine, HookResult
 from braincode.prompts import build_environment_context, build_plan_mode_reminder, build_system_prompt
 from braincode.recovery import RecoveryController, RecoveryNotice
 from braincode.tools import ToolRegistry
@@ -372,6 +371,7 @@ class Agent:
         self._team_manager: Any = None
         self.notification_fn: Callable[[], list[str]] | None = None
         self.file_history: Any = None
+        self._hook_prevent_continuation = False
 
         # 非阻塞 memory recall：prefetch task 与主 LLM 调用并行，工具执行后注入
         self.memory_recall_task: Any | None = None
@@ -435,6 +435,7 @@ class Agent:
             file_path=str(kwargs.get("file_path", "")),
             message=str(kwargs.get("message", "")),
             error=str(kwargs.get("error", "")),
+            tool_output=str(kwargs.get("tool_output", "")),
         )
 
     def _infer_file_path(self, args: dict) -> str:
@@ -453,8 +454,131 @@ class Agent:
             for n in self.hook_engine.drain_notifications()
         ]
 
+    def _inject_hook_contexts(self, conversation: ConversationManager) -> None:
+        if self.hook_engine is None:
+            return
+        for context in self.hook_engine.drain_additional_contexts():
+            if context:
+                conversation.add_system_reminder(context)
+
+    def _latest_user_message(self, conversation: ConversationManager) -> str:
+        for message in reversed(conversation.history):
+            if message.role == "user" and not message.tool_results:
+                return message.content
+        return ""
+
+    async def _run_hook_event(self, event: str, **kwargs: str | dict) -> HookResult:
+        if self.hook_engine is None:
+            return HookResult()
+        result = await self.hook_engine.run_hooks(
+            event, self._build_hook_context(event, **kwargs)
+        )
+        if result.prevent_continuation:
+            self._hook_prevent_continuation = True
+        return result
+
+    async def _apply_pre_tool_hooks(
+        self, tc: ToolCallComplete
+    ) -> tuple[ToolCallComplete, ToolResult | None]:
+        if self.hook_engine is None:
+            return tc, None
+        hook_result = await self._run_hook_event(
+            "pre_tool_use",
+            tool_name=tc.tool_name,
+            tool_args=tc.arguments,
+            file_path=self._infer_file_path(tc.arguments),
+        )
+        arguments = dict(tc.arguments)
+        if hook_result.updated_args:
+            arguments.update(hook_result.updated_args)
+            tc = ToolCallComplete(
+                tool_id=tc.tool_id,
+                tool_name=tc.tool_name,
+                arguments=arguments,
+            )
+        if hook_result.is_rejected:
+            reason = (
+                hook_result.reject_reason
+                or hook_result.message
+                or "Hook rejected tool call"
+            )
+            return tc, ToolResult(output=f"Hook rejected: {reason}", is_error=True)
+        return tc, None
+
+    async def _apply_post_tool_hooks(
+        self, tc: ToolCallComplete, result: ToolResult
+    ) -> ToolResult:
+        if self.hook_engine is None:
+            return result
+        hook_result = await self._run_hook_event(
+            "post_tool_use",
+            tool_name=tc.tool_name,
+            tool_args=tc.arguments,
+            file_path=self._infer_file_path(tc.arguments),
+            tool_output=result.output,
+            error=result.output if result.is_error else "",
+        )
+        if hook_result.updated_output is not None:
+            result = ToolResult(
+                output=hook_result.updated_output,
+                is_error=result.is_error,
+            )
+        if hook_result.is_rejected:
+            result = ToolResult(
+                output=(
+                    hook_result.reject_reason
+                    or hook_result.message
+                    or "Hook cancelled after tool execution"
+                ),
+                is_error=True,
+            )
+        return result
+
+    async def _apply_permission_request_hooks(
+        self,
+        tool: Any,
+        tc: ToolCallComplete,
+        decision: Decision,
+    ) -> tuple[ToolCallComplete, Decision, ToolResult | None]:
+        if decision.effect != "ask" or self.hook_engine is None:
+            return tc, decision, None
+
+        hook_result = await self._run_hook_event(
+            "permission_request",
+            tool_name=tc.tool_name,
+            tool_args=tc.arguments,
+            file_path=self._infer_file_path(tc.arguments),
+        )
+        if hook_result.updated_args:
+            arguments = dict(tc.arguments)
+            arguments.update(hook_result.updated_args)
+            tc = ToolCallComplete(
+                tool_id=tc.tool_id,
+                tool_name=tc.tool_name,
+                arguments=arguments,
+            )
+            decision = self.permission_checker.check(tool, tc.arguments)
+        if hook_result.is_rejected:
+            reason = (
+                hook_result.reject_reason
+                or hook_result.message
+                or "permission request cancelled"
+            )
+            return tc, decision, ToolResult(
+                output=f"Permission denied by Hook: {reason}",
+                is_error=True,
+            )
+        return tc, decision, None
+
     async def run(self, conversation: ConversationManager) -> AsyncIterator[AgentEvent]:
         self._current_conversation = conversation
+        self._hook_prevent_continuation = False
+        user_message = self._latest_user_message(conversation)
+        if self.hook_engine:
+            await self._run_hook_event("user_prompt_submit", message=user_message)
+            for he in self._drain_hook_events():
+                yield he
+
         env_context = build_environment_context(
             self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
         )
@@ -464,8 +588,7 @@ class Agent:
         conversation.inject_long_term_memory(self.instructions_content, memory_content)
 
         if self.hook_engine:
-            ctx = self._build_hook_context("session_start")
-            await self.hook_engine.run_hooks("session_start", ctx)
+            await self._run_hook_event("session_start", message=user_message)
             for he in self._drain_hook_events():
                 yield he
 
@@ -476,7 +599,7 @@ class Agent:
         self.recovery_state.output_token_escalated = False
         self.recovery_state.continuation_count = 0
 
-        while True:
+        while not self._hook_prevent_continuation:
             iteration += 1
 
             if self.max_iterations > 0 and iteration > self.max_iterations:
@@ -486,10 +609,11 @@ class Agent:
                 break
 
             if self.hook_engine:
-                ctx = self._build_hook_context("turn_start")
-                await self.hook_engine.run_hooks("turn_start", ctx)
+                await self._run_hook_event("turn_start")
                 for he in self._drain_hook_events():
                     yield he
+                if self._hook_prevent_continuation:
+                    break
 
             self._consume_mailbox(conversation)
             if self.notification_fn:
@@ -497,10 +621,12 @@ class Agent:
                     conversation.add_system_reminder(note)
 
             if self.hook_engine:
-                ctx = self._build_hook_context("pre_send")
-                await self.hook_engine.run_hooks("pre_send", ctx)
+                await self._run_hook_event("pre_send")
                 for he in self._drain_hook_events():
                     yield he
+                self._inject_hook_contexts(conversation)
+                if self._hook_prevent_continuation:
+                    break
 
             hook_prompts = (
                 self.hook_engine.get_prompt_messages() if self.hook_engine else None
@@ -590,12 +716,13 @@ class Agent:
                 # 流式工具执行：收到完整 tool_use 就立刻提交执行，不等整个响应结束
                 if isinstance(event, ToolUseEvent):
                     tc = collector.response.tool_calls[-1]
-                    # 需要交互式权限确认的工具延迟到流结束后顺序执行
+                    # Hook 可能修改参数并改变权限结论，因此必须先走完整的
+                    # pre_tool_use -> permission lifecycle，再决定是否执行。
                     tool = self.registry.get(tc.tool_name)
-                    needs_ask = False
+                    needs_ask = self.hook_engine is not None
                     if tool and self.permission_checker:
                         decision = self.permission_checker.check(tool, tc.arguments)
-                        needs_ask = decision.effect == "ask"
+                        needs_ask = needs_ask or decision.effect == "ask"
                     if needs_ask:
                         deferred_tool_calls.append(tc)
                     else:
@@ -607,8 +734,11 @@ class Agent:
             self.client = self.recovery_controller.current_client
 
             if self.hook_engine:
-                ctx = self._build_hook_context("post_receive", message=response.text)
-                await self.hook_engine.run_hooks("post_receive", ctx)
+                post_receive = await self._run_hook_event(
+                    "post_receive", message=response.text
+                )
+                if post_receive.updated_output is not None:
+                    response.text = post_receive.updated_output
                 for he in self._drain_hook_events():
                     yield he
 
@@ -623,6 +753,18 @@ class Agent:
                 ConvThinkingBlock(thinking=tb.thinking, signature=tb.signature)
                 for tb in response.thinking_blocks
             ]
+
+            if self._hook_prevent_continuation:
+                if response.text:
+                    conversation.add_assistant_message(
+                        response.text, thinking_blocks=conv_thinking
+                    )
+                if self.hook_engine:
+                    await self._run_hook_event("turn_end")
+                    for he in self._drain_hook_events():
+                        yield he
+                yield LoopComplete(total_turns=iteration)
+                break
 
             if response.stop_reason == "max_tokens":
                 if not max_tokens_escalated:
@@ -674,10 +816,7 @@ class Agent:
                         self._consolidator.maybe_run(self.client, conversation, self.protocol)
                     )
                 if self.hook_engine:
-                    ctx = self._build_hook_context("turn_end")
-                    await self.hook_engine.run_hooks("turn_end", ctx)
-                    ctx = self._build_hook_context("session_end")
-                    await self.hook_engine.run_hooks("session_end", ctx)
+                    await self._run_hook_event("turn_end")
                     for he in self._drain_hook_events():
                         yield he
                 if self.file_history is not None:
@@ -793,17 +932,22 @@ class Agent:
                         pass
                     self._memory_recall_consumed = True
 
-            if exit_plan_called:
-                yield TurnComplete(turn=iteration)
-                yield LoopComplete(total_turns=iteration)
-                break
-
             if self.hook_engine:
-                ctx = self._build_hook_context("turn_end")
-                await self.hook_engine.run_hooks("turn_end", ctx)
+                await self._run_hook_event("turn_end")
                 for he in self._drain_hook_events():
                     yield he
             yield TurnComplete(turn=iteration)
+
+            if exit_plan_called or self._hook_prevent_continuation:
+                yield LoopComplete(total_turns=iteration)
+                break
+
+        if self.hook_engine:
+            await self._run_hook_event("stop")
+            await self._run_hook_event("session_end")
+            for he in self._drain_hook_events():
+                yield he
+        self._hook_prevent_continuation = False
 
 
     def _consume_mailbox(self, conversation: ConversationManager) -> None:
@@ -851,13 +995,48 @@ class Agent:
                 is_unknown=False,
             )
 
+        tc, hook_error = await self._apply_pre_tool_hooks(tc)
+        if hook_error is not None:
+            return _ToolExecResult(
+                tool_id=tc.tool_id,
+                tool_name=tc.tool_name,
+                result=hook_error,
+                elapsed=time.monotonic() - start,
+                is_unknown=False,
+            )
+
         if self.permission_checker:
             decision = self.permission_checker.check(tool, tc.arguments)
+            tc, decision, permission_error = await self._apply_permission_request_hooks(
+                tool, tc, decision
+            )
+            if permission_error is not None:
+                return _ToolExecResult(
+                    tool_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    result=permission_error,
+                    elapsed=time.monotonic() - start,
+                    is_unknown=False,
+                )
             if decision.effect == "deny":
                 return _ToolExecResult(
                     tool_id=tc.tool_id,
                     tool_name=tc.tool_name,
                     result=ToolResult(output=f"Permission denied: {decision.reason}", is_error=True),
+                    elapsed=time.monotonic() - start,
+                    is_unknown=False,
+                )
+            if decision.effect == "ask":
+                return _ToolExecResult(
+                    tool_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    result=ToolResult(
+                        output=(
+                            "Permission denied: tool arguments require "
+                            "interactive confirmation"
+                        ),
+                        is_error=True,
+                    ),
                     elapsed=time.monotonic() - start,
                     is_unknown=False,
                 )
@@ -871,6 +1050,7 @@ class Agent:
             result = ToolResult(output=f"Tool execution error: {e}", is_error=True)
 
         self._snapshot_for_recovery(tc, result)
+        result = await self._apply_post_tool_hooks(tc, result)
 
         return _ToolExecResult(
             tool_id=tc.tool_id,
@@ -912,48 +1092,53 @@ class Agent:
             yield result, elapsed, is_unknown
             return
 
-        # 权限检查
+        tc, hook_error = await self._apply_pre_tool_hooks(tc)
+        if hook_error is not None:
+            yield hook_error, time.monotonic() - start, is_unknown
+            return
+
         if self.permission_checker:
             decision = self.permission_checker.check(tool, tc.arguments)
-
+            tc, decision, permission_error = await self._apply_permission_request_hooks(
+                tool, tc, decision
+            )
+            if permission_error is not None:
+                yield permission_error, time.monotonic() - start, is_unknown
+                return
             if decision.effect == "deny":
                 result = ToolResult(
                     output=f"Permission denied: {decision.reason}",
                     is_error=True,
                 )
-                elapsed = time.monotonic() - start
-                yield result, elapsed, is_unknown
+                yield result, time.monotonic() - start, is_unknown
                 return
-
             if decision.effect == "ask":
                 loop = asyncio.get_running_loop()
                 future: asyncio.Future[PermissionResponse] = loop.create_future()
-                desc = self._build_permission_description(tc)
-                # 向调用方 yield 权限请求事件，由调用方处理
                 yield PermissionRequest(
                     tool_name=tc.tool_name,
-                    description=desc,
+                    description=self._build_permission_description(tc),
                     future=future,
                 )
                 response = await future
-
                 if response == PermissionResponse.DENY:
                     result = ToolResult(
                         output="Permission denied: 用户拒绝了此操作",
                         is_error=True,
                     )
-                    elapsed = time.monotonic() - start
-                    yield result, elapsed, is_unknown
+                    yield result, time.monotonic() - start, is_unknown
                     return
-
                 if response == PermissionResponse.ALLOW_ALWAYS:
                     from braincode.permissions.rules import Rule, extract_content
+
                     content = extract_content(tc.tool_name, tc.arguments)
                     pattern = f"{content[:60]}*" if len(content) > 60 else f"{content}*"
-                    # 持久化规则写入本地文件
-                    rule = Rule(tool_name=tc.tool_name, pattern=pattern, effect="allow")
+                    rule = Rule(
+                        tool_name=tc.tool_name,
+                        pattern=pattern,
+                        effect="allow",
+                    )
                     self.permission_checker.rule_engine.append_local_rule(rule)
-                    # 同时加入会话级放行集合，本轮立即生效无需磁盘读取
                     self.permission_checker.add_session_allow(tc.tool_name, content)
 
         try:
@@ -969,6 +1154,7 @@ class Agent:
             )
 
         self._snapshot_for_recovery(tc, result)
+        result = await self._apply_post_tool_hooks(tc, result)
 
         elapsed = time.monotonic() - start
         yield result, elapsed, is_unknown
@@ -1065,12 +1251,11 @@ class Agent:
         self, task: str, conversation: ConversationManager | None = None,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
+        env_context = build_environment_context(
+            self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
+        )
         if conversation is None:
             conversation = ConversationManager()
-
-            env_context = build_environment_context(
-                self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
-            )
             conversation.inject_environment(env_context)
 
             if self.instructions_content:
@@ -1082,13 +1267,11 @@ class Agent:
         if task:
             conversation.add_user_message(task)
 
-        hook_prompts = (
-            self.hook_engine.get_prompt_messages() if self.hook_engine else None
-        )
-        system = build_system_prompt(
-            hook_prompts=hook_prompts,
-            coordinator_mode=self.coordinator_mode,
-        )
+        self._hook_prevent_continuation = False
+        user_message = task or self._latest_user_message(conversation)
+        if self.hook_engine:
+            await self._run_hook_event("user_prompt_submit", message=user_message)
+            await self._run_hook_event("session_start", message=user_message)
 
         tools = self.registry.get_all_schemas(self.protocol)
 
@@ -1107,18 +1290,33 @@ class Agent:
         self.recovery_state.continuation_count = 0
 
         iteration = 0
-        while True:
+        while not self._hook_prevent_continuation:
             iteration += 1
             if self.max_iterations > 0 and iteration > self.max_iterations:
                 break
             if self.hook_engine:
-                ctx = self._build_hook_context("turn_start")
-                await self.hook_engine.run_hooks("turn_start", ctx)
+                await self._run_hook_event("turn_start")
+                if self._hook_prevent_continuation:
+                    break
 
             self._consume_mailbox(conversation)
             if self.notification_fn:
                 for note in self.notification_fn():
                     conversation.add_system_reminder(note)
+
+            if self.hook_engine:
+                await self._run_hook_event("pre_send")
+                self._inject_hook_contexts(conversation)
+                if self._hook_prevent_continuation:
+                    break
+
+            hook_prompts = (
+                self.hook_engine.get_prompt_messages() if self.hook_engine else None
+            )
+            system = build_system_prompt(
+                hook_prompts=hook_prompts,
+                coordinator_mode=self.coordinator_mode,
+            )
 
             # 先应用 tool-result budget（就地修改），再做 auto-compact，确保预算内的结果不会被误压缩
             pre_compact_records = apply_tool_result_budget(
@@ -1180,6 +1378,12 @@ class Agent:
 
             response = collector.response
             self.client = self.recovery_controller.current_client
+            if self.hook_engine:
+                post_receive = await self._run_hook_event(
+                    "post_receive", message=response.text
+                )
+                if post_receive.updated_output is not None:
+                    response.text = post_receive.updated_output
             self.total_input_tokens += response.input_tokens
             self.total_output_tokens += response.output_tokens
 
@@ -1199,6 +1403,13 @@ class Agent:
                         "type": "stream_text",
                         "text": response.text,
                     })
+
+            if self._hook_prevent_continuation:
+                if response.text:
+                    conversation.add_assistant_message(response.text)
+                if self.hook_engine:
+                    await self._run_hook_event("turn_end")
+                break
 
             if response.stop_reason == "max_tokens":
                 if not max_tokens_escalated:
@@ -1247,6 +1458,8 @@ class Agent:
 
             if not response.tool_calls:
                 conversation.add_assistant_message(response.text)
+                if self.hook_engine:
+                    await self._run_hook_event("turn_end")
                 if self.file_history is not None:
                     summary = response.text[:60] + "..." if len(response.text) > 60 else response.text
                     self.file_history.make_snapshot(len(conversation.history), summary)
@@ -1292,9 +1505,15 @@ class Agent:
             conversation.add_tool_results_message(tool_results)
 
             if self.hook_engine:
-                ctx = self._build_hook_context("turn_end")
-                await self.hook_engine.run_hooks("turn_end", ctx)
+                await self._run_hook_event("turn_end")
 
+            if self._hook_prevent_continuation:
+                break
+
+        if self.hook_engine:
+            await self._run_hook_event("stop")
+            await self._run_hook_event("session_end")
+        self._hook_prevent_continuation = False
         return last_text
 
     async def _recover_context_limit(
@@ -1320,23 +1539,17 @@ class Agent:
                 is_error=True,
             )
 
-        if self.hook_engine:
-            file_path = self._infer_file_path(tc.arguments)
-            hook_ctx = self._build_hook_context(
-                "pre_tool_use",
-                tool_name=tc.tool_name,
-                tool_args=tc.arguments,
-                file_path=file_path,
-            )
-            rejection = await self.hook_engine.run_pre_tool_hooks(hook_ctx)
-            if rejection is not None:
-                return ToolResult(
-                    output=f"Hook rejected: {rejection.reason}",
-                    is_error=True,
-                )
+        tc, hook_error = await self._apply_pre_tool_hooks(tc)
+        if hook_error is not None:
+            return hook_error
 
         if self.permission_checker:
             decision = self.permission_checker.check(tool, tc.arguments)
+            tc, decision, permission_error = await self._apply_permission_request_hooks(
+                tool, tc, decision
+            )
+            if permission_error is not None:
+                return permission_error
             if decision.effect == "deny":
                 return ToolResult(
                     output=f"Permission denied: {decision.reason}",
@@ -1363,17 +1576,8 @@ class Agent:
                 output=f"Tool execution error: {e}", is_error=True
             )
 
-        if self.hook_engine:
-            file_path = self._infer_file_path(tc.arguments)
-            hook_ctx = self._build_hook_context(
-                "post_tool_use",
-                tool_name=tc.tool_name,
-                tool_args=tc.arguments,
-                file_path=file_path,
-            )
-            await self.hook_engine.run_hooks("post_tool_use", hook_ctx)
-
-        return result
+        self._snapshot_for_recovery(tc, result)
+        return await self._apply_post_tool_hooks(tc, result)
 
     def _maybe_persist_or_truncate(self, tool_use_id: str, text: str) -> str:
         from braincode.context.manager import (

@@ -21,6 +21,17 @@ class JobStatus(StrEnum):
     BLOCKED = "blocked"
 
 
+class MisfirePolicy(StrEnum):
+    SKIP = "skip"
+    RUN_ONCE = "run_once"
+
+
+class OverlapPolicy(StrEnum):
+    SKIP = "skip"
+    COALESCE = "coalesce"
+    PARALLEL = "parallel"
+
+
 TERMINAL_JOB_STATUSES = frozenset(
     {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
 )
@@ -91,3 +102,33 @@ class JobEvent:
     payload_json: str
     created_at: datetime
     consumed_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ScheduleSpec:
+    name: str
+    cron_expression: str
+    timezone: str
+    job_kind: JobKind
+    payload_json: str = "{}"
+    enabled: bool = True
+    misfire_policy: MisfirePolicy = MisfirePolicy.SKIP
+    overlap_policy: OverlapPolicy = OverlapPolicy.COALESCE
+    id: str | None = None
+
+
+@dataclass(frozen=True)
+class Schedule:
+    id: str
+    name: str
+    cron_expression: str
+    timezone: str
+    job_kind: JobKind
+    payload_json: str
+    enabled: bool
+    next_run_at: datetime
+    last_run_at: datetime | None
+    misfire_policy: MisfirePolicy
+    overlap_policy: OverlapPolicy
+    created_at: datetime
+    updated_at: datetime

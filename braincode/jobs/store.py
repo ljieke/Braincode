@@ -16,10 +16,14 @@ from braincode.jobs.models import (
     JobQuery,
     JobSpec,
     JobStatus,
+    MisfirePolicy,
+    OverlapPolicy,
+    Schedule,
+    ScheduleSpec,
 )
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 
@@ -92,6 +96,26 @@ class JobStore(Protocol):
     ) -> list[JobEvent]: ...
 
     def mark_failed(self, job_id: str, error: str) -> Job: ...
+
+    def create_schedule(self, spec: ScheduleSpec, next_run_at: datetime) -> Schedule: ...
+
+    def get_schedule(self, schedule_id: str) -> Schedule | None: ...
+
+    def list_schedules(self, *, enabled_only: bool = False) -> list[Schedule]: ...
+
+    def delete_schedule(self, schedule_id: str) -> bool: ...
+
+    def has_active_schedule_job(self, schedule_id: str) -> bool: ...
+
+    def record_schedule_fire(
+        self,
+        schedule_id: str,
+        fire_at: datetime,
+        next_run_at: datetime,
+        *,
+        job_spec: JobSpec | None,
+        disposition: str,
+    ) -> Job | None: ...
 
 
 def _utc_now() -> datetime:
@@ -315,6 +339,45 @@ class SQLiteJobStore:
         )
         connection.execute("UPDATE schema_version SET version = 2")
         connection.execute("PRAGMA user_version = 2")
+
+    @staticmethod
+    def _migrate_2_to_3(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE schedules (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                cron_expression TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                job_kind TEXT NOT NULL CHECK (job_kind IN ('agent', 'tool', 'prompt', 'team')),
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+                next_run_at INTEGER NOT NULL,
+                last_run_at INTEGER,
+                misfire_policy TEXT NOT NULL CHECK (misfire_policy IN ('skip', 'run_once')),
+                overlap_policy TEXT NOT NULL CHECK (overlap_policy IN ('skip', 'coalesce', 'parallel')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE schedule_fires (
+                schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+                fire_at INTEGER NOT NULL,
+                job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+                disposition TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (schedule_id, fire_at)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at)"
+        )
+        connection.execute("UPDATE schema_version SET version = 3")
+        connection.execute("PRAGMA user_version = 3")
 
     def schema_version(self) -> int:
         connection = self._connect()
@@ -891,6 +954,197 @@ class SQLiteJobStore:
                 now,
             )
             return self._row_to_job(connection, self._require_job_row(connection, job_id))
+
+    def create_schedule(self, spec: ScheduleSpec, next_run_at: datetime) -> Schedule:
+        schedule_id = spec.id or uuid.uuid4().hex
+        name = spec.name.strip()
+        if not name:
+            raise ValueError("Schedule name must not be empty")
+        self._validate_payload(spec.payload_json)
+        now = _to_epoch_us(self._now())
+        next_value = _to_epoch_us(next_run_at)
+        with self._transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO schedules(
+                    id, name, cron_expression, timezone, job_kind, payload_json,
+                    enabled, next_run_at, last_run_at, misfire_policy,
+                    overlap_policy, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    schedule_id,
+                    name,
+                    spec.cron_expression,
+                    spec.timezone,
+                    JobKind(spec.job_kind).value,
+                    spec.payload_json,
+                    int(spec.enabled),
+                    next_value,
+                    MisfirePolicy(spec.misfire_policy).value,
+                    OverlapPolicy(spec.overlap_policy).value,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM schedules WHERE id = ?", (schedule_id,)
+            ).fetchone()
+            return self._row_to_schedule(row)
+
+    def get_schedule(self, schedule_id: str) -> Schedule | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM schedules WHERE id = ?", (schedule_id,)
+            ).fetchone()
+            return self._row_to_schedule(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def list_schedules(self, *, enabled_only: bool = False) -> list[Schedule]:
+        connection = self._connect()
+        try:
+            where = " WHERE enabled = 1" if enabled_only else ""
+            rows = connection.execute(
+                "SELECT * FROM schedules" + where + " ORDER BY next_run_at, id"
+            ).fetchall()
+            return [self._row_to_schedule(row) for row in rows]
+        finally:
+            connection.close()
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        with self._transaction(immediate=True) as connection:
+            deleted = connection.execute(
+                "DELETE FROM schedules WHERE id = ?", (schedule_id,)
+            )
+            return deleted.rowcount == 1
+
+    def has_active_schedule_job(self, schedule_id: str) -> bool:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE schedule_id = ? AND status IN (?, ?, ?)
+                LIMIT 1
+                """,
+                (
+                    schedule_id,
+                    JobStatus.PENDING.value,
+                    JobStatus.RUNNING.value,
+                    JobStatus.BLOCKED.value,
+                ),
+            ).fetchone()
+            return row is not None
+        finally:
+            connection.close()
+
+    def record_schedule_fire(
+        self,
+        schedule_id: str,
+        fire_at: datetime,
+        next_run_at: datetime,
+        *,
+        job_spec: JobSpec | None,
+        disposition: str,
+    ) -> Job | None:
+        fire_value = _to_epoch_us(fire_at)
+        next_value = _to_epoch_us(next_run_at)
+        now = _to_epoch_us(self._now())
+        with self._transaction(immediate=True) as connection:
+            self._require_schedule_row(connection, schedule_id)
+            existing = connection.execute(
+                "SELECT 1 FROM schedule_fires WHERE schedule_id = ? AND fire_at = ?",
+                (schedule_id, fire_value),
+            ).fetchone()
+            if existing is not None:
+                return None
+
+            job: Job | None = None
+            job_id: str | None = None
+            if job_spec is not None:
+                job_id = job_spec.id or uuid.uuid4().hex
+                self._validate_payload(job_spec.payload_json)
+                connection.execute(
+                    """
+                    INSERT INTO jobs(
+                        id, kind, name, description, status, payload_json,
+                        result_text, error_text, owner, team_name, worktree_path,
+                        created_at, updated_at, started_at, finished_at, lease_until,
+                        attempts, max_attempts, priority, parent_job_id, schedule_id,
+                        progress_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?, NULL,
+                              NULL, NULL, 0, ?, ?, ?, ?, '{}')
+                    """,
+                    (
+                        job_id,
+                        JobKind(job_spec.kind).value,
+                        job_spec.name,
+                        job_spec.description,
+                        JobStatus.PENDING.value,
+                        job_spec.payload_json,
+                        job_spec.team_name,
+                        job_spec.worktree_path,
+                        now,
+                        now,
+                        job_spec.max_attempts,
+                        job_spec.priority,
+                        job_spec.parent_job_id,
+                        schedule_id,
+                    ),
+                )
+                self._insert_event(connection, job_id, "created", "{}", now)
+            connection.execute(
+                """
+                INSERT INTO schedule_fires(
+                    schedule_id, fire_at, job_id, disposition, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (schedule_id, fire_value, job_id, disposition, now),
+            )
+            connection.execute(
+                """
+                UPDATE schedules
+                SET last_run_at = ?, next_run_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (fire_value, next_value, now, schedule_id),
+            )
+            if job_id is not None:
+                job = self._row_to_job(
+                    connection, self._require_job_row(connection, job_id)
+                )
+            return job
+
+    @staticmethod
+    def _require_schedule_row(
+        connection: sqlite3.Connection, schedule_id: str
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM schedules WHERE id = ?", (schedule_id,)
+        ).fetchone()
+        if row is None:
+            raise JobNotFoundError(f"Schedule '{schedule_id}' not found")
+        return row
+
+    @staticmethod
+    def _row_to_schedule(row: sqlite3.Row) -> Schedule:
+        return Schedule(
+            id=row["id"],
+            name=row["name"],
+            cron_expression=row["cron_expression"],
+            timezone=row["timezone"],
+            job_kind=JobKind(row["job_kind"]),
+            payload_json=row["payload_json"],
+            enabled=bool(row["enabled"]),
+            next_run_at=_from_epoch_us(row["next_run_at"]),
+            last_run_at=_from_epoch_us(row["last_run_at"]),
+            misfire_policy=MisfirePolicy(row["misfire_policy"]),
+            overlap_policy=OverlapPolicy(row["overlap_policy"]),
+            created_at=_from_epoch_us(row["created_at"]),
+            updated_at=_from_epoch_us(row["updated_at"]),
+        )
 
     @staticmethod
     def _insert_event(

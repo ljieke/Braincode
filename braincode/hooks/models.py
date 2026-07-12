@@ -39,6 +39,7 @@ class Hook:
     once: bool = False
     async_exec: bool = False
     executed: bool = False
+    configured_result: HookResult | None = None
 
 
     def should_run(self) -> bool:
@@ -59,6 +60,7 @@ class HookContext:
     file_path: str = ""
     message: str = ""
     error: str = ""
+    tool_output: str = ""
 
     def get_field(self, name: str) -> str:
         if name == "tool":
@@ -78,9 +80,46 @@ class HookContext:
         result = result.replace("$FILE_PATH", self.file_path)
         result = result.replace("$MESSAGE", self.message)
         result = result.replace("$ERROR", self.error)
+        result = result.replace("$TOOL_OUTPUT", self.tool_output)
         for key, value in self.tool_args.items():
             result = result.replace(f"$TOOL_ARGS.{key}", str(value))
         return result
+
+
+@dataclass
+class HookResult:
+    outcome: str = "continue"
+    message: str = ""
+    reject_reason: str = ""
+    prevent_continuation: bool = False
+    updated_args: dict[str, Any] | None = None
+    updated_output: str | None = None
+    additional_context: str = ""
+
+    @property
+    def is_rejected(self) -> bool:
+        return self.outcome in {"reject", "cancel"}
+
+    def expanded(self, ctx: HookContext) -> HookResult:
+        updated_args = None
+        if self.updated_args is not None:
+            updated_args = {
+                key: ctx.expand(value) if isinstance(value, str) else value
+                for key, value in self.updated_args.items()
+            }
+        return HookResult(
+            outcome=self.outcome,
+            message=ctx.expand(self.message),
+            reject_reason=ctx.expand(self.reject_reason),
+            prevent_continuation=self.prevent_continuation,
+            updated_args=updated_args,
+            updated_output=(
+                ctx.expand(self.updated_output)
+                if self.updated_output is not None
+                else None
+            ),
+            additional_context=ctx.expand(self.additional_context),
+        )
 
 
 class ToolRejectedError(Exception):

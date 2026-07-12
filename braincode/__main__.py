@@ -87,6 +87,8 @@ def main() -> None:
             mcp_servers=config.mcp_servers,
             hook_engine=hook_engine,
             recovery_config=config.recovery,
+            scheduler_config=config.scheduler,
+            sandbox_config=config.sandbox,
         )
         asyncio.run(server.run())
         return
@@ -107,6 +109,7 @@ def main() -> None:
         driver_class=NoAltScreenDriver,
         sandbox_config=config.sandbox,
         recovery_config=config.recovery,
+        scheduler_config=config.scheduler,
     )
     app.run()
 
@@ -149,7 +152,25 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     from braincode.worktree import WorktreeManager
     from braincode.config import WorktreeConfig
     from braincode.jobs import JobManager
+    from braincode.jobs import (
+        BackgroundToolRunner,
+        JobKind,
+        MisfirePolicy,
+        OverlapPolicy,
+        PromptJobRunner,
+        SchedulerService,
+    )
     from braincode.recovery import build_recovery_controller
+    from braincode.memory.session import SessionManager
+    from braincode.tools.job_tools import (
+        CronCreateTool,
+        CronDeleteTool,
+        CronListTool,
+        JobCancelTool,
+        JobCreateTool,
+        JobGetTool,
+        JobListTool,
+    )
 
     is_json = output_format == "stream-json"
 
@@ -174,11 +195,28 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
             local_rules_path=Path(work_dir) / ".braincode" / "permissions.local.yaml",
         ),
         mode=permission_mode,
+        sandbox_enabled=(config.sandbox.enabled and config.sandbox.auto_allow),
     )
 
     instructions = load_instructions(work_dir)
     registry = create_default_registry()
     registry.register(ToolSearchTool(registry, protocol=provider.protocol))
+    bash_tool = registry.get("Bash")
+    if bash_tool is not None:
+        bash_tool.work_dir = work_dir
+    if config.sandbox.enabled and bash_tool is not None:
+        from braincode.sandbox import SandboxConfig, create_sandbox
+        os_sandbox = create_sandbox()
+        if os_sandbox and os_sandbox.available():
+            bash_tool.sandbox = os_sandbox
+            bash_tool.sandbox_config = SandboxConfig(
+                allow_write=[work_dir, "/tmp"],
+                deny_write=[
+                    f"{work_dir}/.braincode/config.yaml",
+                    f"{work_dir}/.braincode/permissions.local.yaml",
+                ],
+                network_enabled=config.sandbox.network_enabled,
+            )
 
     agent = Agent(
         client=client,
@@ -202,6 +240,78 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     trace_manager = TraceManager()
     job_manager = JobManager.for_project(work_dir)
     task_manager = TaskManager(job_manager)
+    tool_job_runner = BackgroundToolRunner(
+        job_manager, registry, checker, work_dir=work_dir
+    )
+
+    async def run_scheduled_prompt(job, scheduled_prompt: str) -> str:
+        scheduled_client = create_client(provider)
+        scheduled_session = SessionManager(work_dir).create()
+        scheduled_registry = type(registry)()
+        for scheduled_tool in registry.list_tools():
+            if scheduled_tool.name != "AskUserQuestion":
+                scheduled_registry.register(scheduled_tool)
+        scheduled_agent = Agent(
+            client=scheduled_client,
+            registry=scheduled_registry,
+            protocol=provider.protocol,
+            work_dir=job.worktree_path or work_dir,
+            permission_checker=checker,
+            context_window=provider.get_context_window(),
+            instructions_content=instructions,
+            hook_engine=hook_engine,
+            recovery_controller=build_recovery_controller(
+                scheduled_client, config.providers, config.recovery
+            ),
+        )
+        scheduled_agent.session_id = scheduled_session.session_id
+        try:
+            return await scheduled_agent.run_to_completion(scheduled_prompt)
+        finally:
+            scheduled_session.close()
+
+    prompt_job_runner = PromptJobRunner(
+        job_manager,
+        run_scheduled_prompt,
+        output_dir=Path(work_dir) / ".braincode" / "job-output",
+    )
+
+    def dispatch_scheduled_job(job) -> None:
+        if job.kind == JobKind.TOOL:
+            tool_job_runner.submit_job(job)
+        elif job.kind == JobKind.PROMPT:
+            prompt_job_runner.submit_job(job)
+
+    scheduler = SchedulerService(
+        job_manager.store,
+        poll_interval_seconds=config.scheduler.poll_interval_seconds,
+        on_job_created=dispatch_scheduled_job,
+        default_timezone=config.scheduler.timezone,
+        default_misfire_policy=MisfirePolicy(
+            config.scheduler.default_misfire_policy
+        ),
+        default_overlap_policy=OverlapPolicy(
+            config.scheduler.default_overlap_policy
+        ),
+    )
+    if bash_tool is not None:
+        bash_tool.background_runner = tool_job_runner
+    for job_tool in (
+        JobCreateTool(job_manager, tool_job_runner, prompt_job_runner),
+        JobGetTool(job_manager),
+        JobListTool(job_manager),
+        JobCancelTool(
+            job_manager, tool_job_runner, prompt_job_runner, task_manager
+        ),
+        CronCreateTool(scheduler, tool_job_runner),
+        CronListTool(scheduler),
+        CronDeleteTool(scheduler),
+    ):
+        registry.register(job_tool)
+    tool_job_runner.start_pending()
+    prompt_job_runner.start_pending()
+    if config.scheduler.enabled:
+        scheduler.start()
     agent_loader = AgentLoader(work_dir, enable_verification=config.enable_verification_agent)
     agent_loader.load_all()
     team_manager = TeamManager(
@@ -351,6 +461,9 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
 
     # 如果有 team 在运行，轮询等待 teammate 完成
     if not team_manager._teams:
+        await scheduler.stop()
+        await tool_job_runner.stop()
+        await prompt_job_runner.stop()
         return
 
     for i in range(90):
@@ -375,6 +488,10 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
             emit_json({"type": "assistant", "text": last_result})
         else:
             print(last_result, flush=True)
+
+    await scheduler.stop()
+    await tool_job_runner.stop()
+    await prompt_job_runner.stop()
 
 
 if __name__ == "__main__":

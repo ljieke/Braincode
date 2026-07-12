@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from braincode.hooks.conditions import ConditionParseError, parse_condition
 from braincode.hooks.events import LifecycleEvent
-from braincode.hooks.models import Action, Hook
+from braincode.hooks.models import Action, Hook, HookResult
 
 _VALID_EVENTS = {e.value for e in LifecycleEvent}
 _VALID_ACTION_TYPES = {"command", "prompt", "http", "agent"}
@@ -75,9 +75,9 @@ def load_hooks(raw_hooks: list[dict] | None) -> list[Hook]:
             )
 
         async_exec = bool(entry.get("async", False))
-        if async_exec and event == "pre_tool_use":
+        if async_exec and reject:
             raise HookConfigError(
-                f"{label}: 'async' cannot be used with 'pre_tool_use' event"
+                f"{label}: async hooks cannot reject the current invocation"
             )
 
         condition = None
@@ -106,6 +106,42 @@ def load_hooks(raw_hooks: list[dict] | None) -> list[Hook]:
             timeout=timeout,
         )
 
+        configured_result = None
+        raw_result = entry.get("result")
+        if raw_result is not None:
+            if not isinstance(raw_result, dict):
+                raise HookConfigError(f"{label}: 'result' must be a mapping")
+            outcome = str(raw_result.get("outcome", "continue"))
+            if outcome not in {"continue", "reject", "cancel"}:
+                raise HookConfigError(f"{label}: invalid result outcome '{outcome}'")
+            updated_args = raw_result.get("updated_args")
+            if updated_args is not None and not isinstance(updated_args, dict):
+                raise HookConfigError(f"{label}: result.updated_args must be a mapping")
+            configured_result = HookResult(
+                outcome=outcome,
+                message=str(raw_result.get("message", "")),
+                reject_reason=str(raw_result.get("reject_reason", "")),
+                prevent_continuation=bool(
+                    raw_result.get("prevent_continuation", False)
+                ),
+                updated_args=updated_args,
+                updated_output=(
+                    str(raw_result["updated_output"])
+                    if "updated_output" in raw_result
+                    else None
+                ),
+                additional_context=str(raw_result.get("additional_context", "")),
+            )
+            if async_exec and (
+                configured_result.is_rejected
+                or configured_result.prevent_continuation
+                or configured_result.updated_args is not None
+                or configured_result.updated_output is not None
+            ):
+                raise HookConfigError(
+                    f"{label}: async hooks may only return message/additional_context"
+                )
+
         hooks.append(
             Hook(
                 id=hook_id,
@@ -115,8 +151,8 @@ def load_hooks(raw_hooks: list[dict] | None) -> list[Hook]:
                 reject=reject,
                 once=bool(entry.get("once", False)),
                 async_exec=async_exec,
+                configured_result=configured_result,
             )
         )
 
     return hooks
-

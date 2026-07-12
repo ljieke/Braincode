@@ -285,6 +285,53 @@ def validate_recovery(raw_recovery: dict | None) -> dict:
     return result
 
 
+def validate_scheduler(raw_scheduler: dict | None) -> dict:
+    defaults = {
+        "enabled": False,
+        "timezone": "UTC",
+        "poll_interval_seconds": 1.0,
+        "default_misfire_policy": "skip",
+        "default_overlap_policy": "coalesce",
+    }
+    if raw_scheduler is None:
+        return defaults
+    if not isinstance(raw_scheduler, dict):
+        raise ConfigError("'scheduler' must be a mapping")
+    result = dict(defaults)
+    enabled = raw_scheduler.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("'scheduler.enabled' must be a boolean")
+    result["enabled"] = enabled
+    timezone = raw_scheduler.get("timezone", defaults["timezone"])
+    if not isinstance(timezone, str) or not timezone.strip():
+        raise ConfigError("'scheduler.timezone' must be a timezone name")
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ConfigError(f"Unknown scheduler timezone: {timezone}") from exc
+    result["timezone"] = timezone
+    interval = raw_scheduler.get(
+        "poll_interval_seconds", defaults["poll_interval_seconds"]
+    )
+    if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
+        raise ConfigError("'scheduler.poll_interval_seconds' must be positive")
+    result["poll_interval_seconds"] = float(interval)
+    misfire = raw_scheduler.get(
+        "default_misfire_policy", defaults["default_misfire_policy"]
+    )
+    if misfire not in {"skip", "run_once"}:
+        raise ConfigError("Invalid scheduler.default_misfire_policy")
+    result["default_misfire_policy"] = misfire
+    overlap = raw_scheduler.get(
+        "default_overlap_policy", defaults["default_overlap_policy"]
+    )
+    if overlap not in {"skip", "coalesce", "parallel"}:
+        raise ConfigError("Invalid scheduler.default_overlap_policy")
+    result["default_overlap_policy"] = overlap
+    return result
+
+
 def validate_config_structure(raw: object) -> dict:
     """校验的主入口。校验解析后的原始配置，返回清洗后的字典。
 
@@ -298,6 +345,7 @@ def validate_config_structure(raw: object) -> dict:
 
     providers = validate_providers(raw["providers"])
     recovery = validate_recovery(raw.get("recovery"))
+    scheduler = validate_scheduler(raw.get("scheduler"))
     provider_names = {provider["name"] for provider in providers}
     unknown_fallbacks = [
         name for name in recovery["fallback_providers"] if name not in provider_names
@@ -324,4 +372,5 @@ def validate_config_structure(raw: object) -> dict:
         ),
         "sandbox": validate_sandbox(raw.get("sandbox")),
         "recovery": recovery,
+        "scheduler": scheduler,
     }

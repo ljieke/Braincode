@@ -6,8 +6,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from braincode.jobs.models import Job, JobEvent, JobKind, JobQuery, JobSpec, JobStatus
+from braincode.jobs.models import (
+    Job,
+    JobEvent,
+    JobKind,
+    JobQuery,
+    JobSpec,
+    JobStatus,
+    Schedule,
+    ScheduleSpec,
+)
 from braincode.jobs.store import JobStateError, SQLiteJobStore
+from braincode.jobs.cron import CronExpression
 
 
 DEFAULT_LEASE_SECONDS = 30
@@ -41,6 +51,18 @@ class JobManager:
 
     def create(self, spec: JobSpec) -> Job:
         return self.store.create(spec)
+
+    def create_schedule(self, spec: ScheduleSpec) -> Schedule:
+        next_run = CronExpression.parse(spec.cron_expression).next_after(
+            self.store._now(), spec.timezone
+        )
+        return self.store.create_schedule(spec, next_run)
+
+    def list_schedules(self) -> list[Schedule]:
+        return self.store.list_schedules()
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        return self.store.delete_schedule(schedule_id)
 
     def create_agent(
         self,

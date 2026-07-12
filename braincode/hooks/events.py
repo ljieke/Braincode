@@ -9,6 +9,7 @@ from enum import StrEnum
 
 
 class LifecycleEvent(StrEnum):
+    USER_PROMPT_SUBMIT = "user_prompt_submit"
     # 会话（Session）级别
     SESSION_START = "session_start"
     SESSION_END = "session_end"
@@ -33,6 +34,6 @@ class LifecycleEvent(StrEnum):
     ERROR = "error"
     COMPACT = "compact"
     PERMISSION_REQUEST = "permission_request"
+    STOP = "stop"
     FILE_CHANGE = "file_change"
     COMMAND_EXECUTE = "command_execute"
-

@@ -6,8 +6,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
+import os
 import re
 import shlex
+import signal
+import shutil
+import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
@@ -15,9 +22,99 @@ from pydantic import BaseModel, Field
 from braincode.tools.base import Tool, ToolResult
 
 if TYPE_CHECKING:
+    from braincode.jobs.runners import BackgroundToolRunner
     from braincode.sandbox import Sandbox, SandboxConfig
 
 MAX_TIMEOUT = 600
+log = logging.getLogger(__name__)
+
+
+async def _terminate_process_tree(
+    proc: asyncio.subprocess.Process, *, used_shell: bool
+) -> None:
+    if proc.returncode is not None:
+        return
+    if os.name == "nt" and used_shell:
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/PID",
+            str(proc.pid),
+            "/T",
+            "/F",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        output, _ = await killer.communicate()
+        if killer.returncode:
+            log.warning(
+                "taskkill failed for pid %s: %s",
+                proc.pid,
+                output.decode(errors="replace").strip(),
+            )
+            proc.kill()
+    elif os.name != "nt":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        proc.kill()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=2)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
+def _contains_shell_operator(command: str) -> bool:
+    operators = {"|", "&", "<", ">", "\n", "`", "$", "*", "?"}
+    if os.name != "nt":
+        operators.add(";")
+    else:
+        operators.update({"%", "^", "(", ")"})
+    quote = ""
+    escaped = False
+    for char in command:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote:
+            escaped = True
+            continue
+        if char in {'"', "'"}:
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+            continue
+        if quote == '"' and char in ({"$", "`", "%"} if os.name == "nt" else {"$", "`"}):
+            return True
+        if not quote and char in operators:
+            return True
+    return False
+
+
+def _split_direct_command(command: str) -> list[str]:
+    tokens = shlex.split(command, posix=os.name != "nt")
+    if os.name == "nt":
+        tokens = [
+            token[1:-1]
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
+            else token
+            for token in tokens
+        ]
+    return tokens
+
+
+def _can_run_direct(command: str) -> bool:
+    try:
+        arguments = _split_direct_command(command)
+    except ValueError:
+        return False
+    if not arguments:
+        return False
+    executable = arguments[0]
+    return Path(executable).is_file() or shutil.which(executable) is not None
 
 # 特殊命令的退出码语义映射
 # 这些命令的 exit code 1 不代表错误，只有 >= 阈值才算真正的错误
@@ -111,6 +208,10 @@ def _exit_code_hint(command: str, exit_code: int) -> str:
 class Params(BaseModel):
     command: str = Field(description="Shell command to execute")
     timeout: int = Field(default=120, description="Timeout in seconds (max 600)")
+    run_in_background: bool = Field(
+        default=False,
+        description="Run as a durable background Job and return its Job ID immediately",
+    )
 
 
 class Bash(Tool):
@@ -125,8 +226,31 @@ class Bash(Tool):
     # OS 级沙箱实例和配置（由外部注入，为 None 时不启用沙箱）
     sandbox: Sandbox | None = None
     sandbox_config: SandboxConfig | None = None
+    background_runner: BackgroundToolRunner | None = None
 
     async def execute(self, params: Params) -> ToolResult:
+        if params.run_in_background:
+            if self.background_runner is None:
+                return ToolResult(
+                    output="Background Bash is not configured", is_error=True
+                )
+            job = self.background_runner.enqueue(
+                self.name,
+                params.model_dump(),
+                cwd=self.work_dir,
+            )
+            if job.is_terminal:
+                return ToolResult(
+                    output=f"Background Bash rejected. Job ID: {job.id}\n{job.error_text}",
+                    is_error=True,
+                )
+            return ToolResult(
+                output=(
+                    "Bash launched as a durable background Job.\n"
+                    f"Job ID: {job.id}\n"
+                    "Use JobGet or /jobs to inspect its status."
+                )
+            )
         timeout = min(params.timeout, MAX_TIMEOUT)
 
         # 如果启用了 OS 沙箱，将命令包装为沙箱内执行
@@ -134,17 +258,52 @@ class Bash(Tool):
         if self.sandbox and self.sandbox_config and self.sandbox.available():
             actual_command = self.sandbox.wrap(params.command, self.sandbox_config)
 
+        proc: asyncio.subprocess.Process | None = None
+        communicate_task: asyncio.Task[tuple[bytes, bytes | None]] | None = None
+        used_shell = (
+            _contains_shell_operator(actual_command)
+            or not _can_run_direct(actual_command)
+        )
         try:
-            proc = await asyncio.create_subprocess_shell(
-                actual_command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,  # 合并 stderr 到 stdout
-                cwd=self.work_dir,
+            process_kwargs = {
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.STDOUT,
+                "cwd": self.work_dir,
+            }
+            if os.name == "nt":
+                process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                process_kwargs["start_new_session"] = True
+            if used_shell:
+                proc = await asyncio.create_subprocess_shell(
+                    actual_command,
+                    **process_kwargs,
+                )
+            else:
+                arguments = _split_direct_command(actual_command)
+                if not arguments:
+                    return ToolResult(output="Error: empty command", is_error=True)
+                proc = await asyncio.create_subprocess_exec(
+                    *arguments,
+                    **process_kwargs,
+                )
+            communicate_task = asyncio.create_task(proc.communicate())
+            stdout, _ = await asyncio.wait_for(
+                asyncio.shield(communicate_task), timeout=timeout
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                await _terminate_process_tree(proc, used_shell=used_shell)
+            if communicate_task is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(communicate_task, timeout=2)
+            raise
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            assert proc is not None
+            await _terminate_process_tree(proc, used_shell=used_shell)
+            if communicate_task is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(communicate_task, timeout=2)
             return ToolResult(output=f"Error: command timed out after {timeout}s", is_error=True)
         except Exception as e:
             return ToolResult(output=f"Error executing command: {e}", is_error=True)
@@ -154,6 +313,7 @@ class Bash(Tool):
 
         # 非零退出码时追加退出码信息，但 is_error 始终为 False
         # 只有超时和异常才设置 is_error=True
+        assert proc is not None
         exit_code = proc.returncode or 0
         if exit_code != 0:
             hint = _exit_code_hint(params.command, exit_code)
@@ -166,4 +326,3 @@ class Bash(Tool):
             output = "(no output)"
 
         return ToolResult(output=output, is_error=False)
-

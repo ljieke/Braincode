@@ -50,7 +50,12 @@ from braincode.commands import (
 )
 from braincode.commands.completion import CompletionPopup
 from braincode.commands.handlers import register_all_commands
-from braincode.config import MCPServerConfig, ProviderConfig, RecoveryConfig
+from braincode.config import (
+    MCPServerConfig,
+    ProviderConfig,
+    RecoveryConfig,
+    SchedulerConfig,
+)
 from braincode.recovery import build_recovery_controller
 from braincode.hooks import HookContext, HookEngine, load_hooks
 from braincode.conversation import ConversationManager, Message
@@ -606,6 +611,7 @@ class BraincodeApp(App):
         driver_class: type | None = None,
         sandbox_config: Any = None,
         recovery_config: RecoveryConfig | None = None,
+        scheduler_config: SchedulerConfig | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
         self.providers = providers
@@ -620,6 +626,7 @@ class BraincodeApp(App):
         from braincode.config import SandboxAppConfig
         self._sandbox_cfg: SandboxAppConfig = sandbox_config or SandboxAppConfig()
         self._recovery_config = recovery_config or RecoveryConfig()
+        self._scheduler_config = scheduler_config or SchedulerConfig()
         self.file_cache = FileCache()
         self.client: LLMClient | None = None
         self.conversation = ConversationManager()
@@ -661,6 +668,9 @@ class BraincodeApp(App):
         self._mcp_connecting: bool = False
         self._teammate_tree: TeammateTree | None = None
         self._teammate_timer = None
+        self.scheduler = None
+        self.tool_job_runner = None
+        self.prompt_job_runner = None
         # 记录本次会话是否曾退出过 Plan Mode，用于重入时注入提示
         self._has_exited_plan_mode: bool = False
 
@@ -800,6 +810,120 @@ class BraincodeApp(App):
         )
         self.agent.file_history = self.file_history
         self.agent.session_id = self.session.session_id
+
+        from braincode.jobs import (
+            BackgroundToolRunner,
+            JobKind,
+            MisfirePolicy,
+            OverlapPolicy,
+            PromptJobRunner,
+            SchedulerService,
+        )
+        from braincode.tools.job_tools import (
+            CronCreateTool,
+            CronDeleteTool,
+            CronListTool,
+            JobCancelTool,
+            JobCreateTool,
+            JobGetTool,
+            JobListTool,
+        )
+
+        self.tool_job_runner = BackgroundToolRunner(
+            self.job_manager,
+            self.registry,
+            checker,
+            work_dir=work_dir,
+        )
+
+        async def run_scheduled_prompt(job, prompt: str) -> str:
+            scheduled_client = create_client(provider)
+            scheduled_session = self.session_manager.create()
+            scheduled_registry = ToolRegistry()
+            for scheduled_tool in self.registry.list_tools():
+                if scheduled_tool.name != "AskUserQuestion":
+                    scheduled_registry.register(scheduled_tool)
+            scheduled_agent = Agent(
+                client=scheduled_client,
+                registry=scheduled_registry,
+                protocol=provider.protocol,
+                work_dir=job.worktree_path or work_dir,
+                permission_checker=checker,
+                context_window=provider.get_context_window(),
+                instructions_content=self._instructions_content,
+                memory_manager=self.memory_manager,
+                hook_engine=self.hook_engine,
+                recovery_controller=build_recovery_controller(
+                    scheduled_client, self.providers, self._recovery_config
+                ),
+            )
+            scheduled_agent.session_id = scheduled_session.session_id
+            try:
+                return await scheduled_agent.run_to_completion(prompt)
+            finally:
+                scheduled_session.close()
+
+        self.prompt_job_runner = PromptJobRunner(
+            self.job_manager,
+            run_scheduled_prompt,
+            output_dir=Path(work_dir) / ".braincode" / "job-output",
+        )
+
+        def dispatch_scheduled_job(job) -> None:
+            if job.kind == JobKind.TOOL:
+                self.tool_job_runner.submit_job(job)
+            elif job.kind == JobKind.PROMPT:
+                self.prompt_job_runner.submit_job(job)
+
+        self.scheduler = SchedulerService(
+            self.job_manager.store,
+            poll_interval_seconds=self._scheduler_config.poll_interval_seconds,
+            on_job_created=dispatch_scheduled_job,
+            default_timezone=self._scheduler_config.timezone,
+            default_misfire_policy=MisfirePolicy(
+                self._scheduler_config.default_misfire_policy
+            ),
+            default_overlap_policy=OverlapPolicy(
+                self._scheduler_config.default_overlap_policy
+            ),
+        )
+        bash_tool = self.registry.get("Bash")
+        if bash_tool is not None:
+            bash_tool.work_dir = work_dir
+            bash_tool.background_runner = self.tool_job_runner
+        for job_tool in (
+            JobCreateTool(
+                self.job_manager, self.tool_job_runner, self.prompt_job_runner
+            ),
+            JobGetTool(self.job_manager),
+            JobListTool(self.job_manager),
+            JobCancelTool(
+                self.job_manager,
+                self.tool_job_runner,
+                self.prompt_job_runner,
+                self.task_manager,
+            ),
+            CronCreateTool(self.scheduler, self.tool_job_runner),
+            CronListTool(self.scheduler),
+            CronDeleteTool(self.scheduler),
+        ):
+            self.registry.register(job_tool)
+        self.tool_job_runner.start_pending()
+        self.prompt_job_runner.start_pending()
+        if self._scheduler_config.enabled:
+            self.scheduler.start()
+
+        from braincode.commands.handlers.jobs import create_jobs_command
+        from braincode.commands.handlers.cron import create_cron_command
+        self.command_registry.register_sync(
+            create_jobs_command(
+                self.job_manager,
+                self.tool_job_runner,
+                self.prompt_job_runner,
+                self.task_manager,
+            )
+        )
+        self.command_registry.register_sync(create_cron_command(self.scheduler))
 
         self._exit_plan_tool._is_plan_mode = lambda: self.agent.plan_mode
         self._exit_plan_tool._plan_exists = lambda: self.agent._get_plan_path().exists()
@@ -1981,6 +2105,12 @@ class BraincodeApp(App):
                     )
                 ))
             tasks.append(asyncio.create_task(self._shutdown_mcp()))
+            if self.scheduler is not None:
+                tasks.append(asyncio.create_task(self.scheduler.stop()))
+            if self.tool_job_runner is not None:
+                tasks.append(asyncio.create_task(self.tool_job_runner.stop()))
+            if self.prompt_job_runner is not None:
+                tasks.append(asyncio.create_task(self.prompt_job_runner.stop()))
 
             if tasks:
                 await asyncio.wait(tasks, timeout=3.0)

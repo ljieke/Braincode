@@ -29,7 +29,14 @@ def test_fresh_database_uses_wal_and_current_schema(tmp_path: Path) -> None:
             )
         }
     assert journal_mode.lower() == "wal"
-    assert {"schema_version", "jobs", "job_dependencies", "job_events"} <= tables
+    assert {
+        "schema_version",
+        "jobs",
+        "job_dependencies",
+        "job_events",
+        "schedules",
+        "schedule_fires",
+    } <= tables
     with sqlite3.connect(path) as connection:
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(jobs)")
@@ -71,6 +78,25 @@ def test_version_one_database_migrates_without_losing_jobs(tmp_path: Path) -> No
     job = store.get("legacy")
     assert job is not None
     assert job.progress_json == "{}"
+
+
+def test_version_two_database_migrates_to_schedule_schema(tmp_path: Path) -> None:
+    path = tmp_path / "runtime.db"
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        SQLiteJobStore._migrate_0_to_1(connection)
+        SQLiteJobStore._migrate_1_to_2(connection)
+
+    store = SQLiteJobStore(path)
+    assert store.schema_version() == CURRENT_SCHEMA_VERSION
+    with sqlite3.connect(path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert {"schedules", "schedule_fires"} <= tables
 
 
 def test_future_schema_version_is_rejected(tmp_path: Path) -> None:
