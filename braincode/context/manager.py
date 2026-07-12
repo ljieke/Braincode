@@ -496,6 +496,30 @@ class RecoveryState:
         self._lock = threading.Lock()
         self._files: dict[str, FileReadRecord] = {}
         self._skills: dict[str, SkillInvocationRecord] = {}
+        self.attempt = 0
+        self.rate_limit_attempts = 0
+        self.overload_attempts = 0
+        self.network_attempts = 0
+        self.context_recovery_attempted = False
+        self.output_token_escalated = False
+        self.continuation_count = 0
+        self.current_provider_index = 0
+        self.stream_started = False
+        self.any_output_emitted = False
+        self.tool_call_completed = False
+        self.tool_execution_started = False
+
+    def reset_llm_request(self, provider_index: int = 0) -> None:
+        self.attempt = 0
+        self.rate_limit_attempts = 0
+        self.overload_attempts = 0
+        self.network_attempts = 0
+        self.context_recovery_attempted = False
+        self.current_provider_index = provider_index
+        self.stream_started = False
+        self.any_output_emitted = False
+        self.tool_call_completed = False
+        self.tool_execution_started = False
 
     def record_file_read(self, path: str, content: str) -> None:
         if not path:
@@ -857,7 +881,13 @@ async def auto_compact(
             from braincode.tools.base import StreamEnd, StreamEvent, TextDelta
 
             collected_text = ""
-            async for event in client.stream(summary_conv, system=SUMMARY_PROMPT, tools=tool_schemas):
+            from braincode.recovery import stream_with_recovery
+            async for event in stream_with_recovery(
+                client,
+                summary_conv,
+                system=SUMMARY_PROMPT,
+                tools=tool_schemas,
+            ):
                 if isinstance(event, TextDelta):
                     collected_text += event.text
                 elif isinstance(event, StreamEnd):

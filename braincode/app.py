@@ -50,7 +50,8 @@ from braincode.commands import (
 )
 from braincode.commands.completion import CompletionPopup
 from braincode.commands.handlers import register_all_commands
-from braincode.config import MCPServerConfig, ProviderConfig
+from braincode.config import MCPServerConfig, ProviderConfig, RecoveryConfig
+from braincode.recovery import build_recovery_controller
 from braincode.hooks import HookContext, HookEngine, load_hooks
 from braincode.conversation import ConversationManager, Message
 from braincode.mcp import ConnectResult, MCPManager
@@ -604,6 +605,7 @@ class BraincodeApp(App):
         enable_coordinator_mode: bool = False,
         driver_class: type | None = None,
         sandbox_config: Any = None,
+        recovery_config: RecoveryConfig | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
         self.providers = providers
@@ -617,6 +619,7 @@ class BraincodeApp(App):
         self._enable_coordinator_mode = enable_coordinator_mode
         from braincode.config import SandboxAppConfig
         self._sandbox_cfg: SandboxAppConfig = sandbox_config or SandboxAppConfig()
+        self._recovery_config = recovery_config or RecoveryConfig()
         self.file_cache = FileCache()
         self.client: LLMClient | None = None
         self.conversation = ConversationManager()
@@ -714,6 +717,10 @@ class BraincodeApp(App):
         work_dir = os.getcwd()
         home = Path.home()
 
+        from braincode.jobs import JobManager
+        self.job_manager = JobManager.for_project(work_dir)
+        self.task_manager = TaskManager(self.job_manager)
+
         # 根据配置决定是否启用 OS 级沙箱自动放行
         sandbox_auto_allow = (
             self._sandbox_cfg.enabled and self._sandbox_cfg.auto_allow
@@ -787,6 +794,9 @@ class BraincodeApp(App):
             instructions_content=self._instructions_content,
             memory_manager=self.memory_manager,
             hook_engine=self.hook_engine,
+            recovery_controller=build_recovery_controller(
+                self.client, self.providers, self._recovery_config
+            ),
         )
         self.agent.file_history = self.file_history
         self.agent.session_id = self.session.session_id
@@ -879,7 +889,11 @@ class BraincodeApp(App):
         from braincode.tools.team_create import TeamCreateTool
         from braincode.tools.team_delete import TeamDeleteTool
 
-        self.team_manager = TeamManager(worktree_manager=self.worktree_manager, trace_manager=self.trace_manager)
+        self.team_manager = TeamManager(
+            worktree_manager=self.worktree_manager,
+            trace_manager=self.trace_manager,
+            job_manager=self.job_manager,
+        )
 
         agent_tool = AgentTool(
             agent_loader=self.agent_loader,
@@ -1250,7 +1264,10 @@ class BraincodeApp(App):
             mini_conv = ConversationManager()
             mini_conv.history = [Message(role="user", content=user_message)]
             collected = ""
-            async for event in side_client.stream(mini_conv, system=system_prompt):
+            from braincode.recovery import stream_with_recovery
+            async for event in stream_with_recovery(
+                side_client, mini_conv, system=system_prompt
+            ):
                 if isinstance(event, TextDelta):
                     collected += event.text
                 elif isinstance(event, StreamEnd):
@@ -1393,7 +1410,12 @@ class BraincodeApp(App):
                     self.call_after_refresh(chat.scroll_end, animate=False)
 
                 elif isinstance(event, RetryEvent):
-                    self._show_system_message(f"↻ Retrying: {event.reason}")
+                    provider = f" [{event.provider_name}]" if event.provider_name else ""
+                    attempt = f" #{event.attempt}" if event.attempt else ""
+                    action = "Provider switched" if event.provider_switched else "Retrying"
+                    self._show_system_message(
+                        f"↻ {action}{attempt}{provider}: {event.reason}"
+                    )
 
                 elif isinstance(event, ToolUseEvent):
                     if accumulated_text:
@@ -1562,7 +1584,7 @@ class BraincodeApp(App):
                 f"{status_icon} 后台任务完成: [{task.id}] {task.name} — {task.status}"
             )
 
-            if hasattr(self, 'team_manager'):
+            if hasattr(self, 'team_manager') and task.agent is not None:
                 self.team_manager.on_teammate_completed(task.agent.agent_id)
 
         self._agent_task = asyncio.create_task(

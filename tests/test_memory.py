@@ -137,7 +137,13 @@ class TestLoadInstructions:
         assert result.index("root level") < result.index("legacy level")
         assert "---" in result
 
-    def test_no_files_returns_empty(self, tmp_path: Path) -> None:
+    def test_no_files_returns_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "braincode.memory.instructions._project_instruction_dirs",
+            lambda root: [root],
+        )
         result = load_instructions(str(tmp_path))
         assert result == ""
 

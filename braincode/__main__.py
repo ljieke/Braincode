@@ -86,6 +86,7 @@ def main() -> None:
             providers=config.providers,
             mcp_servers=config.mcp_servers,
             hook_engine=hook_engine,
+            recovery_config=config.recovery,
         )
         asyncio.run(server.run())
         return
@@ -105,6 +106,7 @@ def main() -> None:
         enable_coordinator_mode=config.enable_coordinator_mode,
         driver_class=NoAltScreenDriver,
         sandbox_config=config.sandbox,
+        recovery_config=config.recovery,
     )
     app.run()
 
@@ -146,6 +148,8 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     from braincode.tools.team_delete import TeamDeleteTool
     from braincode.worktree import WorktreeManager
     from braincode.config import WorktreeConfig
+    from braincode.jobs import JobManager
+    from braincode.recovery import build_recovery_controller
 
     is_json = output_format == "stream-json"
 
@@ -185,6 +189,9 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         context_window=provider.get_context_window(),
         instructions_content=instructions,
         hook_engine=hook_engine,
+        recovery_controller=build_recovery_controller(
+            client, config.providers, config.recovery
+        ),
     )
 
     wt_cfg = config.worktree or WorktreeConfig()
@@ -193,10 +200,15 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         symlink_directories=wt_cfg.symlink_directories,
     )
     trace_manager = TraceManager()
-    task_manager = TaskManager()
+    job_manager = JobManager.for_project(work_dir)
+    task_manager = TaskManager(job_manager)
     agent_loader = AgentLoader(work_dir, enable_verification=config.enable_verification_agent)
     agent_loader.load_all()
-    team_manager = TeamManager(worktree_manager=wt_manager, trace_manager=trace_manager)
+    team_manager = TeamManager(
+        worktree_manager=wt_manager,
+        trace_manager=trace_manager,
+        job_manager=job_manager,
+    )
 
     agent_tool = AgentTool(
         agent_loader=agent_loader,
@@ -324,7 +336,14 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
 
         elif isinstance(event, RetryEvent):
             if is_json:
-                emit_json({"type": "retry", "reason": event.reason})
+                emit_json({
+                    "type": "retry",
+                    "reason": event.reason,
+                    "attempt": event.attempt,
+                    "wait": event.wait,
+                    "provider": event.provider_name,
+                    "provider_switched": event.provider_switched,
+                })
 
         elif isinstance(event, PermissionRequest):
             # -p 非交互模式：自动批准所有权限请求
@@ -360,4 +379,3 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
 
 if __name__ == "__main__":
     main()
-

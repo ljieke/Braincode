@@ -450,7 +450,9 @@ class MemoryManager:
 
         collected = ""
         try:
-            async for event in client.stream(
+            from braincode.recovery import stream_with_recovery
+            async for event in stream_with_recovery(
+                client,
                 extract_conv, system="You are a memory extraction assistant."
             ):
                 if isinstance(event, TextDelta):

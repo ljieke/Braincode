@@ -240,6 +240,51 @@ def validate_sandbox(raw_sb: dict | None) -> dict:
     return result
 
 
+def validate_recovery(raw_recovery: dict | None) -> dict:
+    defaults = {
+        "max_retries": 6,
+        "base_delay_seconds": 0.5,
+        "max_delay_seconds": 32.0,
+        "max_output_continuations": 3,
+        "fallback_providers": [],
+    }
+    if raw_recovery is None:
+        return defaults
+    if not isinstance(raw_recovery, dict):
+        raise ConfigError("'recovery' must be a mapping")
+    result = dict(defaults)
+    max_retries = raw_recovery.get("max_retries", defaults["max_retries"])
+    if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 0:
+        raise ConfigError("'recovery.max_retries' must be a non-negative integer")
+    result["max_retries"] = max_retries
+    for key in ("base_delay_seconds", "max_delay_seconds"):
+        value = raw_recovery.get(key, defaults[key])
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ConfigError(f"'recovery.{key}' must be a non-negative number")
+        result[key] = float(value)
+    if result["max_delay_seconds"] < result["base_delay_seconds"]:
+        raise ConfigError(
+            "'recovery.max_delay_seconds' must be >= base_delay_seconds"
+        )
+    continuations = raw_recovery.get(
+        "max_output_continuations", defaults["max_output_continuations"]
+    )
+    if not isinstance(continuations, int) or isinstance(continuations, bool) or continuations < 0:
+        raise ConfigError(
+            "'recovery.max_output_continuations' must be a non-negative integer"
+        )
+    result["max_output_continuations"] = continuations
+    fallbacks = raw_recovery.get("fallback_providers", [])
+    if not isinstance(fallbacks, list) or not all(
+        isinstance(value, str) and value.strip() for value in fallbacks
+    ):
+        raise ConfigError("'recovery.fallback_providers' must be a list of names")
+    if len(set(fallbacks)) != len(fallbacks):
+        raise ConfigError("'recovery.fallback_providers' must not contain duplicates")
+    result["fallback_providers"] = fallbacks
+    return result
+
+
 def validate_config_structure(raw: object) -> dict:
     """校验的主入口。校验解析后的原始配置，返回清洗后的字典。
 
@@ -251,8 +296,20 @@ def validate_config_structure(raw: object) -> dict:
     if not isinstance(raw, dict) or "providers" not in raw:
         raise ConfigError("Config must contain a 'providers' list")
 
+    providers = validate_providers(raw["providers"])
+    recovery = validate_recovery(raw.get("recovery"))
+    provider_names = {provider["name"] for provider in providers}
+    unknown_fallbacks = [
+        name for name in recovery["fallback_providers"] if name not in provider_names
+    ]
+    if unknown_fallbacks:
+        raise ConfigError(
+            "Unknown recovery fallback provider(s): "
+            + ", ".join(unknown_fallbacks)
+        )
+
     return {
-        "providers": validate_providers(raw["providers"]),
+        "providers": providers,
         "permission_mode": validate_permission_mode(raw.get("permission_mode", "default")),
         "mcp_servers": validate_mcp_servers(raw.get("mcp_servers")),
         "hooks": validate_hooks(raw.get("hooks")),
@@ -266,4 +323,5 @@ def validate_config_structure(raw: object) -> dict:
             raw.get("enable_coordinator_mode", False), "enable_coordinator_mode"
         ),
         "sandbox": validate_sandbox(raw.get("sandbox")),
+        "recovery": recovery,
     }

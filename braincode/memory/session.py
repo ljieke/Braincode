@@ -441,7 +441,9 @@ async def generate_session_summary(
 
     collected = ""
     try:
-        async for event in client.stream(
+        from braincode.recovery import stream_with_recovery
+        async for event in stream_with_recovery(
+            client,
             summary_conv, system=SESSION_SUMMARY_PROMPT
         ):
             if isinstance(event, TextDelta):

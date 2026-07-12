@@ -84,23 +84,143 @@ def _mark_last_tool_for_cache(tools: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 class LLMError(Exception):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+        retry_after: float | None = None,
+        provider_name: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+        self.retry_after = retry_after
+        self.provider_name = provider_name
 
 
 class AuthenticationError(LLMError):
-    pass
+    def __init__(self, message: str, *, provider_name: str = "") -> None:
+        super().__init__(
+            message,
+            status_code=401,
+            retryable=False,
+            provider_name=provider_name,
+        )
+
+
+class InvalidRequestError(LLMError):
+    def __init__(
+        self, message: str, *, status_code: int = 400, provider_name: str = ""
+    ) -> None:
+        super().__init__(
+            message,
+            status_code=status_code,
+            retryable=False,
+            provider_name=provider_name,
+        )
 
 
 class RateLimitError(LLMError):
 
 
-    def __init__(self, message: str, retry_after: float | None = None):
-        super().__init__(message)
-        self.retry_after = retry_after
+    def __init__(
+        self,
+        message: str,
+        retry_after: float | None = None,
+        *,
+        provider_name: str = "",
+    ) -> None:
+        super().__init__(
+            message,
+            status_code=429,
+            retryable=True,
+            retry_after=retry_after,
+            provider_name=provider_name,
+        )
+
+
+class OverloadedError(LLMError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 529,
+        retry_after: float | None = None,
+        provider_name: str = "",
+    ) -> None:
+        super().__init__(
+            message,
+            status_code=status_code,
+            retryable=True,
+            retry_after=retry_after,
+            provider_name=provider_name,
+        )
 
 
 class NetworkError(LLMError):
+    def __init__(self, message: str, *, provider_name: str = "") -> None:
+        super().__init__(message, retryable=True, provider_name=provider_name)
+
+
+class ContextLimitError(InvalidRequestError):
     pass
+
+
+class StreamInterruptedError(LLMError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_name: str = "",
+        any_output_emitted: bool = False,
+        tool_call_completed: bool = False,
+    ) -> None:
+        super().__init__(message, retryable=False, provider_name=provider_name)
+        self.any_output_emitted = any_output_emitted
+        self.tool_call_completed = tool_call_completed
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _status_error(status_code: int, message: str, provider_name: str) -> LLMError:
+    lowered = message.lower()
+    if status_code in {400, 413, 422} and any(
+        marker in lowered
+        for marker in (
+            "context length",
+            "context_length",
+            "maximum context",
+            "prompt is too long",
+            "prompt too long",
+            "too many tokens",
+        )
+    ):
+        return ContextLimitError(
+            message, status_code=status_code, provider_name=provider_name
+        )
+    if status_code in {400, 404, 409, 413, 422}:
+        return InvalidRequestError(
+            message, status_code=status_code, provider_name=provider_name
+        )
+    if status_code in {502, 503, 504, 529}:
+        return OverloadedError(
+            message, status_code=status_code, provider_name=provider_name
+        )
+    return LLMError(
+        message,
+        status_code=status_code,
+        retryable=status_code >= 500,
+        provider_name=provider_name,
+    )
 
 
 class LLMClient(ABC):
@@ -128,6 +248,7 @@ def _supports_adaptive_thinking(model: str) -> bool:
 
 class AnthropicClient(LLMClient):
     def __init__(self, config: ProviderConfig) -> None:
+        self.provider_name = config.name
         self.model = config.model
         self.thinking = config.thinking
         self.max_output_tokens = config.get_max_output_tokens()
@@ -135,7 +256,8 @@ class AnthropicClient(LLMClient):
         if not api_key:
             raise AuthenticationError(
                 "Anthropic API key not found. "
-                "Set it in .braincode/config.yaml or via ANTHROPIC_API_KEY env var."
+                "Set it in .braincode/config.yaml or via ANTHROPIC_API_KEY env var.",
+                provider_name=self.provider_name,
             )
         self._client = AsyncAnthropic(api_key=api_key, base_url=config.base_url)
 
@@ -309,28 +431,39 @@ class AnthropicClient(LLMClient):
                 )
 
         except _anthropic.AuthenticationError as e:
-            raise AuthenticationError(f"Invalid API key: {e}") from e
+            raise AuthenticationError(
+                f"Invalid API key: {e}", provider_name=self.provider_name
+            ) from e
         except _anthropic.RateLimitError as e:
             retry = e.response.headers.get("retry-after") if e.response else None
             raise RateLimitError(
                 f"Rate limited. {f'Retry after {retry}s.' if retry else 'Please wait.'}",
-                retry_after=float(retry) if retry else None,
+                retry_after=_parse_retry_after(retry),
+                provider_name=self.provider_name,
             ) from e
         except _anthropic.APIConnectionError as e:
-            raise NetworkError(f"Network error: {e}") from e
+            raise NetworkError(
+                f"Network error: {e}", provider_name=self.provider_name
+            ) from e
         except _anthropic.APIStatusError as e:
-            raise LLMError(f"API error ({e.status_code}): {e.message}") from e
+            raise _status_error(
+                e.status_code,
+                f"API error ({e.status_code}): {e.message}",
+                self.provider_name,
+            ) from e
 
 
 class OpenAIClient(LLMClient):
     def __init__(self, config: ProviderConfig) -> None:
+        self.provider_name = config.name
         self.model = config.model
         self.max_output_tokens = config.get_max_output_tokens()
         api_key = config.resolve_api_key()
         if not api_key:
             raise AuthenticationError(
                 "OpenAI API key not found. "
-                "Set it in .braincode/config.yaml or via OPENAI_API_KEY env var."
+                "Set it in .braincode/config.yaml or via OPENAI_API_KEY env var.",
+                provider_name=self.provider_name,
             )
         self._client = AsyncOpenAI(api_key=api_key, base_url=config.base_url)
 
@@ -432,19 +565,28 @@ class OpenAIClient(LLMClient):
                     )
 
         except _openai.AuthenticationError as e:
-            raise AuthenticationError(f"Invalid API key: {e}") from e
+            raise AuthenticationError(
+                f"Invalid API key: {e}", provider_name=self.provider_name
+            ) from e
         except _openai.RateLimitError as e:
             retry = None
             if hasattr(e, "response") and e.response is not None:
                 retry = e.response.headers.get("retry-after")
             raise RateLimitError(
                 f"Rate limited. {f'Retry after {retry}s.' if retry else 'Please wait.'}",
-                retry_after=float(retry) if retry else None,
+                retry_after=_parse_retry_after(retry),
+                provider_name=self.provider_name,
             ) from e
         except _openai.APIConnectionError as e:
-            raise NetworkError(f"Network error: {e}") from e
+            raise NetworkError(
+                f"Network error: {e}", provider_name=self.provider_name
+            ) from e
         except _openai.APIStatusError as e:
-            raise LLMError(f"API error ({e.status_code}): {e.message}") from e
+            raise _status_error(
+                e.status_code,
+                f"API error ({e.status_code}): {e.message}",
+                self.provider_name,
+            ) from e
 
 
 class OpenAICompatClient(LLMClient):
@@ -457,13 +599,15 @@ class OpenAICompatClient(LLMClient):
     """
 
     def __init__(self, config: ProviderConfig) -> None:
+        self.provider_name = config.name
         self.model = config.model
         self.max_output_tokens = config.get_max_output_tokens()
         api_key = config.resolve_api_key()
         if not api_key:
             raise AuthenticationError(
                 "OpenAI-compatible API key not found. "
-                "Set it in .braincode/config.yaml or via OPENAI_API_KEY env var."
+                "Set it in .braincode/config.yaml or via OPENAI_API_KEY env var.",
+                provider_name=self.provider_name,
             )
         self._client = AsyncOpenAI(api_key=api_key, base_url=config.base_url)
 
@@ -603,19 +747,28 @@ class OpenAICompatClient(LLMClient):
                         active_calls.clear()
 
         except _openai.AuthenticationError as e:
-            raise AuthenticationError(f"Invalid API key: {e}") from e
+            raise AuthenticationError(
+                f"Invalid API key: {e}", provider_name=self.provider_name
+            ) from e
         except _openai.RateLimitError as e:
             retry = None
             if hasattr(e, "response") and e.response is not None:
                 retry = e.response.headers.get("retry-after")
             raise RateLimitError(
                 f"Rate limited. {f'Retry after {retry}s.' if retry else 'Please wait.'}",
-                retry_after=float(retry) if retry else None,
+                retry_after=_parse_retry_after(retry),
+                provider_name=self.provider_name,
             ) from e
         except _openai.APIConnectionError as e:
-            raise NetworkError(f"Network error: {e}") from e
+            raise NetworkError(
+                f"Network error: {e}", provider_name=self.provider_name
+            ) from e
         except _openai.APIStatusError as e:
-            raise LLMError(f"API error ({e.status_code}): {e.message}") from e
+            raise _status_error(
+                e.status_code,
+                f"API error ({e.status_code}): {e.message}",
+                self.provider_name,
+            ) from e
 
 
 def create_client(config: ProviderConfig) -> LLMClient:

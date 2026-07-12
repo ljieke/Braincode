@@ -137,6 +137,15 @@ class SandboxAppConfig:
 
 
 @dataclass
+class RecoveryConfig:
+    max_retries: int = 6
+    base_delay_seconds: float = 0.5
+    max_delay_seconds: float = 32.0
+    max_output_continuations: int = 3
+    fallback_providers: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AppConfig:
     providers: list[ProviderConfig]
     permission_mode: str = "default"
@@ -148,6 +157,7 @@ class AppConfig:
     teammate_mode: str = ""
     enable_coordinator_mode: bool = False
     sandbox: SandboxAppConfig = field(default_factory=SandboxAppConfig)
+    recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
 
 
 def _load_single_file(path: Path) -> AppConfig:
@@ -198,6 +208,15 @@ def _load_single_file(path: Path) -> AppConfig:
         network_enabled=sb["network_enabled"],
     )
 
+    recovery = validated["recovery"]
+    recovery_cfg = RecoveryConfig(
+        max_retries=recovery["max_retries"],
+        base_delay_seconds=recovery["base_delay_seconds"],
+        max_delay_seconds=recovery["max_delay_seconds"],
+        max_output_continuations=recovery["max_output_continuations"],
+        fallback_providers=list(recovery["fallback_providers"]),
+    )
+
     return AppConfig(
         providers=providers,
         permission_mode=validated["permission_mode"],
@@ -209,6 +228,7 @@ def _load_single_file(path: Path) -> AppConfig:
         teammate_mode=validated["teammate_mode"],
         enable_coordinator_mode=validated["enable_coordinator_mode"],
         sandbox=sandbox_cfg,
+        recovery=recovery_cfg,
     )
 
 
@@ -243,6 +263,8 @@ def _merge_config(base: AppConfig, override: AppConfig) -> AppConfig:
         base.sandbox.auto_allow = True
     if override.sandbox.network_enabled:
         base.sandbox.network_enabled = True
+    if override.recovery != RecoveryConfig():
+        base.recovery = override.recovery
     return base
 
 

@@ -42,6 +42,7 @@ from braincode.permissions import (
 from braincode.hooks import HookContext, HookEngine, ToolRejectedError
 from braincode.hooks.engine import HookNotification
 from braincode.prompts import build_environment_context, build_plan_mode_reminder, build_system_prompt
+from braincode.recovery import RecoveryController, RecoveryNotice
 from braincode.tools import ToolRegistry
 from braincode.tools.base import (
     MAX_OUTPUT_CHARS,
@@ -60,7 +61,6 @@ log = logging.getLogger(__name__)
 
 MEMORY_EXTRACTION_INTERVAL = 1
 MAX_TOKENS_CEILING = 64000
-MAX_OUTPUT_TOKENS_RECOVERIES = 3
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +81,9 @@ class ThinkingText:
 class RetryEvent:
     reason: str
     wait: float = 0.0
+    attempt: int = 0
+    provider_name: str = ""
+    provider_switched: bool = False
 
 
 @dataclass
@@ -193,10 +196,18 @@ class StreamCollector:
         self.response = LLMResponse()
 
     async def consume(
-        self, stream: AsyncIterator[StreamEvent]
+        self, stream: AsyncIterator[StreamEvent | RecoveryNotice]
     ) -> AsyncIterator[AgentEvent]:
         async for event in stream:
-            if isinstance(event, TextDelta):
+            if isinstance(event, RecoveryNotice):
+                yield RetryEvent(
+                    reason=event.reason,
+                    wait=event.wait,
+                    attempt=event.attempt,
+                    provider_name=event.provider_name,
+                    provider_switched=event.event_type == "provider_switched",
+                )
+            elif isinstance(event, TextDelta):
                 self.response.text += event.text
                 yield StreamText(text=event.text)
             elif isinstance(event, ThinkingDelta):
@@ -313,6 +324,7 @@ class Agent:
         instructions_content: str = "",
         memory_manager: MemoryManager | None = None,
         hook_engine: HookEngine | None = None,
+        recovery_controller: RecoveryController | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -331,6 +343,7 @@ class Agent:
         # 最近的文件读取和 skill 调用。每次 ReadFile / skill 调用时记录，
         # auto_compact 触发阈值时消费。
         self.recovery_state: RecoveryState = RecoveryState()
+        self.recovery_controller = recovery_controller or RecoveryController([client])
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.instructions_content = instructions_content
@@ -460,6 +473,8 @@ class Agent:
         consecutive_unknown = 0
         max_tokens_escalated = False
         output_recoveries = 0
+        self.recovery_state.output_token_escalated = False
+        self.recovery_state.continuation_count = 0
 
         while True:
             iteration += 1
@@ -564,7 +579,13 @@ class Agent:
             collector = StreamCollector()
             executor = StreamingExecutor()
             deferred_tool_calls: list[ToolCallComplete] = []
-            llm_stream = self.client.stream(conversation, system=system, tools=tools)
+            llm_stream = self.recovery_controller.stream(
+                conversation,
+                system=system,
+                tools=tools,
+                state=self.recovery_state,
+                context_recover=lambda: self._recover_context_limit(conversation),
+            )
             async for event in collector.consume(llm_stream):
                 # 流式工具执行：收到完整 tool_use 就立刻提交执行，不等整个响应结束
                 if isinstance(event, ToolUseEvent):
@@ -578,10 +599,12 @@ class Agent:
                     if needs_ask:
                         deferred_tool_calls.append(tc)
                     else:
+                        self.recovery_state.tool_execution_started = True
                         executor.submit(self._execute_single_tool_direct(tc))
                 yield event
 
             response = collector.response
+            self.client = self.recovery_controller.current_client
 
             if self.hook_engine:
                 ctx = self._build_hook_context("post_receive", message=response.text)
@@ -605,6 +628,7 @@ class Agent:
                 if not max_tokens_escalated:
                     self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
                     max_tokens_escalated = True
+                    self.recovery_state.output_token_escalated = True
                     if response.text:
                         conversation.add_assistant_message(
                             response.text, thinking_blocks=conv_thinking
@@ -615,8 +639,9 @@ class Agent:
                         )
                     yield RetryEvent(reason="max_tokens escalation")
                     continue
-                elif output_recoveries < MAX_OUTPUT_TOKENS_RECOVERIES:
+                elif output_recoveries < self.recovery_controller.policy.max_output_continuations:
                     output_recoveries += 1
+                    self.recovery_state.continuation_count = output_recoveries
                     conversation.add_assistant_message(
                         response.text, thinking_blocks=conv_thinking
                     )
@@ -625,7 +650,10 @@ class Agent:
                         "Break remaining work into smaller pieces."
                     )
                     yield RetryEvent(
-                        reason=f"max_tokens recovery {output_recoveries}/{MAX_OUTPUT_TOKENS_RECOVERIES}"
+                        reason=(
+                            f"max_tokens recovery {output_recoveries}/"
+                            f"{self.recovery_controller.policy.max_output_continuations}"
+                        )
                     )
                     continue
             else:
@@ -708,6 +736,7 @@ class Agent:
 
             # 需要交互式权限确认的工具，在流结束后顺序执行
             for tc in deferred_tool_calls:
+                self.recovery_state.tool_execution_started = True
                 result: ToolResult | None = None
                 elapsed = 0.0
                 is_unknown = False
@@ -1072,6 +1101,10 @@ class Agent:
         )
 
         last_text = ""
+        max_tokens_escalated = False
+        output_recoveries = 0
+        self.recovery_state.output_token_escalated = False
+        self.recovery_state.continuation_count = 0
 
         iteration = 0
         while True:
@@ -1125,11 +1158,28 @@ class Agent:
                 append_replacement_records(self.session_dir, _new_records)
 
             collector = StreamCollector()
-            llm_stream = self.client.stream(conversation, system=system, tools=tools)
+            llm_stream = self.recovery_controller.stream(
+                conversation,
+                system=system,
+                tools=tools,
+                state=self.recovery_state,
+                context_recover=lambda: self._recover_context_limit(conversation),
+            )
             async for _event in collector.consume(llm_stream):
-                pass
+                if isinstance(_event, RetryEvent) and event_callback:
+                    event_callback(
+                        {
+                            "type": "retry",
+                            "reason": _event.reason,
+                            "attempt": _event.attempt,
+                            "wait": _event.wait,
+                            "provider": _event.provider_name,
+                            "providerSwitched": _event.provider_switched,
+                        }
+                    )
 
             response = collector.response
+            self.client = self.recovery_controller.current_client
             self.total_input_tokens += response.input_tokens
             self.total_output_tokens += response.output_tokens
 
@@ -1149,6 +1199,45 @@ class Agent:
                         "type": "stream_text",
                         "text": response.text,
                     })
+
+            if response.stop_reason == "max_tokens":
+                if not max_tokens_escalated:
+                    self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
+                    max_tokens_escalated = True
+                    self.recovery_state.output_token_escalated = True
+                    if response.text:
+                        conversation.add_assistant_message(response.text)
+                        conversation.add_user_message(
+                            "Output token limit hit. Resume directly from where you stopped. "
+                            "Do not apologize or repeat previous content."
+                        )
+                    if event_callback:
+                        event_callback(
+                            {"type": "retry", "reason": "max_tokens escalation"}
+                        )
+                    continue
+                if output_recoveries < self.recovery_controller.policy.max_output_continuations:
+                    output_recoveries += 1
+                    self.recovery_state.continuation_count = output_recoveries
+                    conversation.add_assistant_message(response.text)
+                    conversation.add_user_message(
+                        "Output token limit hit. Resume directly from where you stopped. "
+                        "Break remaining work into smaller pieces."
+                    )
+                    if event_callback:
+                        event_callback(
+                            {
+                                "type": "retry",
+                                "reason": (
+                                    "max_tokens recovery "
+                                    f"{output_recoveries}/"
+                                    f"{self.recovery_controller.policy.max_output_continuations}"
+                                ),
+                            }
+                        )
+                    continue
+            else:
+                output_recoveries = 0
 
             log.info(
                 "[run_to_completion] agent=%s iter=%d tool_calls=%d text_len=%d stop=%s",
@@ -1183,6 +1272,7 @@ class Agent:
 
             tool_results: list[ToolResultBlock] = []
             for tc in response.tool_calls:
+                self.recovery_state.tool_execution_started = True
                 if event_callback:
                     event_callback({
                         "type": "tool_use",
@@ -1206,6 +1296,13 @@ class Agent:
                 await self.hook_engine.run_hooks("turn_end", ctx)
 
         return last_text
+
+    async def _recover_context_limit(
+        self, conversation: ConversationManager
+    ) -> bool:
+        self.client = self.recovery_controller.current_client
+        result = await self.manual_compact(conversation)
+        return isinstance(result, CompactNotification)
 
     async def _execute_tool_noninteractive(
         self, tc: ToolCallComplete

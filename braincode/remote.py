@@ -44,7 +44,7 @@ from braincode.client import create_client, resolve_context_window
 from braincode.commands import CommandContext, CommandRegistry, CommandType
 from braincode.commands.handlers import register_all_commands
 from braincode.commands.parser import parse_command
-from braincode.config import MCPServerConfig, ProviderConfig
+from braincode.config import MCPServerConfig, ProviderConfig, RecoveryConfig
 from braincode.conversation import ConversationManager
 from braincode.hooks import HookEngine
 from braincode.mcp import MCPManager
@@ -76,12 +76,14 @@ class RemoteServer:
         hook_engine: HookEngine | None = None,
         addr: str = "0.0.0.0",
         port: int = 18888,
+        recovery_config: RecoveryConfig | None = None,
     ) -> None:
         self.providers = providers
         self._mcp_server_configs = mcp_servers or []
         self.hook_engine = hook_engine
         self.addr = addr
         self.port = port
+        self._recovery_config = recovery_config or RecoveryConfig()
 
         # WebSocket 连接池（支持多客户端广播）
         self._connections: set[ServerConnection] = set()
@@ -246,6 +248,7 @@ class RemoteServer:
 
         # 创建 LLM 客户端
         client = create_client(provider)
+        from braincode.recovery import build_recovery_controller
 
         # 工具注册表
         self.registry = create_default_registry()
@@ -268,6 +271,9 @@ class RemoteServer:
             instructions_content=instructions,
             memory_manager=self.memory_manager,
             hook_engine=self.hook_engine,
+            recovery_controller=build_recovery_controller(
+                client, self.providers, self._recovery_config
+            ),
         )
         self.agent.session_id = self.session_id
 
@@ -475,6 +481,9 @@ class RemoteServer:
                         "data": {
                             "reason": event.reason,
                             "waitMs": int(event.wait * 1000),
+                            "attempt": event.attempt,
+                            "provider": event.provider_name,
+                            "providerSwitched": event.provider_switched,
                         },
                     })
 

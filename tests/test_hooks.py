@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any, AsyncIterator
 from unittest.mock import patch
 
@@ -250,10 +251,14 @@ class TestCommandExecutor:
         assert "src/main.py" in result.output
 
     @pytest.mark.asyncio
-    async def test_timeout(self):
+    async def test_timeout(self, python_command: Callable[[str], str]):
         from braincode.hooks.executors import execute_command
 
-        action = Action(type="command", command="sleep 10", timeout=1)
+        action = Action(
+            type="command",
+            command=python_command("import time; time.sleep(10)"),
+            timeout=1,
+        )
         ctx = HookContext()
         result = await execute_command(action, ctx)
         assert result.success is False
@@ -515,8 +520,30 @@ class TestAgentHookIntegration:
         from braincode.agent import Agent, ToolResultEvent
         from braincode.client import LLMClient
         from braincode.conversation import ConversationManager
+        from pydantic import BaseModel
         from braincode.tools import create_default_registry
-        from braincode.tools.base import StreamEnd, StreamEvent, TextDelta, ToolCallComplete
+        from braincode.tools.base import (
+            StreamEnd,
+            TextDelta,
+            Tool,
+            ToolCallComplete,
+            ToolResult,
+        )
+
+        executed = {"value": False}
+
+        class TestToolParams(BaseModel):
+            command: str
+
+        class TestTool(Tool):
+            name = "HookTestTool"
+            description = "A harmless tool used to verify hook rejection."
+            params_model = TestToolParams
+            category = "command"
+
+            async def execute(self, params: TestToolParams) -> ToolResult:
+                executed["value"] = True
+                return ToolResult(output=f"executed: {params.command}")
 
         class MockClient(LLMClient):
             def __init__(self):
@@ -527,8 +554,8 @@ class TestAgentHookIntegration:
                 if self._call == 1:
                     yield ToolCallComplete(
                         tool_id="t1",
-                        tool_name="Bash",
-                        arguments={"command": "rm -rf /"},
+                        tool_name="HookTestTool",
+                        arguments={"command": "blocked operation"},
                     )
                     yield StreamEnd(stop_reason="tool_use", input_tokens=10, output_tokens=5)
                 else:
@@ -539,13 +566,16 @@ class TestAgentHookIntegration:
             id="block-rm",
             event="pre_tool_use",
             action=Action(type="command", command="echo dangerous command blocked"),
-            condition=parse_condition('tool == "Bash" && args.command =~ /rm\\s+-rf/'),
+            condition=parse_condition(
+                'tool == "HookTestTool" && args.command =~ /blocked/'
+            ),
             reject=True,
         )
         engine = HookEngine([hook])
 
         client = MockClient()
         registry = create_default_registry()
+        registry.register(TestTool())
         conv = ConversationManager()
         conv.add_user_message("delete everything")
 
@@ -565,3 +595,4 @@ class TestAgentHookIntegration:
         rejected = tool_results[0]
         assert rejected.is_error is True
         assert "Hook rejected" in rejected.output
+        assert executed["value"] is False

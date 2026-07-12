@@ -25,6 +25,7 @@ from braincode.teams.spawn_inprocess import InProcessTeammateHandle
 
 if TYPE_CHECKING:
     from braincode.agent import Agent
+    from braincode.jobs.manager import JobManager
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +35,12 @@ class TeamError(Exception):
 
 
 class TeamManager:
-    def __init__(self, worktree_manager: Any = None, trace_manager: Any = None) -> None:
+    def __init__(
+        self,
+        worktree_manager: Any = None,
+        trace_manager: Any = None,
+        job_manager: JobManager | None = None,
+    ) -> None:
         self._teams: dict[str, AgentTeam] = {}
         self._task_stores: dict[str, SharedTaskStore] = {}
         self._mailboxes: dict[str, Mailbox] = {}
@@ -43,6 +49,7 @@ class TeamManager:
         self._detected_backend: BackendType | None = None
         self._worktree_manager = worktree_manager
         self._trace_manager = trace_manager
+        self._job_manager = job_manager
         self._teammate_team_map: dict[str, str] = {}  # agent_id -> team_name
 
     def detect_backend(
@@ -77,7 +84,9 @@ class TeamManager:
         )
         team.save()
 
-        task_store = SharedTaskStore(team_dir / "tasks.json")
+        task_store = SharedTaskStore(
+            team_dir / "tasks.json", self._job_manager, slug
+        )
         task_store.init_empty()
 
         mailbox_dir = team_dir / "mailbox"
@@ -109,7 +118,7 @@ class TeamManager:
         team_dir = resolve_team_dir(team_name)
         tasks_path = team_dir / "tasks.json"
         if tasks_path.exists():
-            store = SharedTaskStore(tasks_path)
+            store = SharedTaskStore(tasks_path, self._job_manager, team_name)
             self._task_stores[team_name] = store
             return store
         return None
