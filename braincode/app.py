@@ -664,13 +664,13 @@ class BraincodeApp(App):
         self._current_ai_row: Vertical | None = None
         self._current_accumulated_text: str = ""
         self._mcp_instructions: str = ""
-        self._mcp_instructions_ok: bool = False
         self._mcp_connecting: bool = False
         self._teammate_tree: TeammateTree | None = None
         self._teammate_timer = None
         self.scheduler = None
         self.tool_job_runner = None
         self.prompt_job_runner = None
+        self.runtime = None
         # 记录本次会话是否曾退出过 Plan Mode，用于重入时注入提示
         self._has_exited_plan_mode: bool = False
 
@@ -887,6 +887,16 @@ class BraincodeApp(App):
                 self._scheduler_config.default_overlap_policy
             ),
         )
+        from braincode.prompt_state import (
+            CronPromptStateProvider,
+            JobPromptStateProvider,
+        )
+        self.agent.register_prompt_state_provider(
+            JobPromptStateProvider(self.job_manager)
+        )
+        self.agent.register_prompt_state_provider(
+            CronPromptStateProvider(self.scheduler)
+        )
         bash_tool = self.registry.get("Bash")
         if bash_tool is not None:
             bash_tool.work_dir = work_dir
@@ -982,6 +992,10 @@ class BraincodeApp(App):
             repo_root=work_dir,
             symlink_directories=wt_cfg.symlink_directories,
         )
+        from braincode.prompt_state import WorktreePromptStateProvider
+        self.agent.register_prompt_state_provider(
+            WorktreePromptStateProvider(self.worktree_manager)
+        )
         restored = self.worktree_manager.restore_session()
         if restored:
             self.agent.work_dir = restored.worktree_path
@@ -1017,6 +1031,10 @@ class BraincodeApp(App):
             worktree_manager=self.worktree_manager,
             trace_manager=self.trace_manager,
             job_manager=self.job_manager,
+        )
+        from braincode.prompt_state import TeamPromptStateProvider
+        self.agent.register_prompt_state_provider(
+            TeamPromptStateProvider(self.team_manager)
         )
 
         agent_tool = AgentTool(
@@ -1085,6 +1103,33 @@ class BraincodeApp(App):
         self.registry.register(SyntheticOutputTool())
         self.agent._team_manager = self.team_manager
 
+        from braincode.runtime import RuntimeContainer
+        self.runtime = RuntimeContainer.adopt(
+            client=self.client,
+            agent=self.agent,
+            registry=self.registry,
+            permission_checker=checker,
+            job_manager=self.job_manager,
+            scheduler=self.scheduler,
+            team_manager=self.team_manager,
+            worktree_manager=self.worktree_manager,
+            hook_engine=self.hook_engine,
+            tool_job_runner=self.tool_job_runner,
+            prompt_job_runner=self.prompt_job_runner,
+            task_manager=self.task_manager,
+            trace_manager=self.trace_manager,
+            memory_manager=self.memory_manager,
+            session_manager=self.session_manager,
+            session=self.session,
+            skill_loader=self.skill_loader,
+            agent_loader=self.agent_loader,
+            load_skill_tool=self._load_skill_tool,
+            install_skill_tool=self._install_skill_tool,
+            mcp_configs=self._mcp_server_configs,
+        )
+        self.runtime.stale_cleanup_task = self._stale_cleanup_task
+        self.runtime.event_bus.subscribe(self._on_runtime_event)
+
         if self.hook_engine:
             asyncio.ensure_future(
                 self.hook_engine.run_hooks(
@@ -1094,6 +1139,8 @@ class BraincodeApp(App):
 
         if self._mcp_server_configs:
             self._mcp_init_task = asyncio.create_task(self._init_mcp())
+            if self.runtime is not None:
+                self.runtime.mcp_init_task = self._mcp_init_task
 
         self.query_one("#model-label", Static).update(provider.model)
         work_dir = os.getcwd()
@@ -1138,6 +1185,28 @@ class BraincodeApp(App):
 
     def add_system_message(self, text: str) -> None:
         self._show_system_message(text)
+
+    def _on_runtime_event(self, event) -> None:
+        event_type = event.type.value
+        payload = event.payload
+        if event_type == "retry_started":
+            self._show_system_message(
+                f"Retrying provider: {payload.get('reason', '')}"
+            )
+        elif event_type == "provider_switched":
+            self._show_system_message(
+                f"Provider switched to {payload.get('provider', '')}: "
+                f"{payload.get('reason', '')}"
+            )
+        elif event_type in {"job_completed", "job_failed", "job_cancelled"}:
+            self._show_system_message(
+                f"Job {payload.get('job_id', '')} {payload.get('status', event_type)}"
+            )
+        elif event_type == "hook_rejected":
+            self._show_system_message(
+                f"Hook rejected {payload.get('tool_name', 'tool')}: "
+                f"{payload.get('reason', '')}"
+            )
 
     def send_user_message(self, text: str) -> None:
         if self._streaming or self.agent is None:
@@ -1474,10 +1543,6 @@ class BraincodeApp(App):
             if self.session:
                 self.session.append(Message(role="user", content=text))
 
-        if self._mcp_instructions and not self._mcp_instructions_ok:
-            self.conversation.add_system_reminder(self._mcp_instructions)
-            self._mcp_instructions_ok = True
-
         # 非阻塞 memory recall：传给 agent，工具执行后注入
         if prefetch_task is not None:
             self.agent.memory_recall_task = prefetch_task
@@ -1534,12 +1599,7 @@ class BraincodeApp(App):
                     self.call_after_refresh(chat.scroll_end, animate=False)
 
                 elif isinstance(event, RetryEvent):
-                    provider = f" [{event.provider_name}]" if event.provider_name else ""
-                    attempt = f" #{event.attempt}" if event.attempt else ""
-                    action = "Provider switched" if event.provider_switched else "Retrying"
-                    self._show_system_message(
-                        f"↻ {action}{attempt}{provider}: {event.reason}"
-                    )
+                    pass  # RuntimeEventBus owns retry/provider notifications.
 
                 elif isinstance(event, ToolUseEvent):
                     if accumulated_text:
@@ -2016,10 +2076,14 @@ class BraincodeApp(App):
     async def _init_mcp(self) -> None:
         self._mcp_connecting = True
         self._update_mode_label()
-        manager = MCPManager()
-        manager.load_configs(self._mcp_server_configs)
         tools_before = len(self.registry.list_tools())
-        connect_result: ConnectResult = await manager.register_all_tools(self.registry)
+        if self.runtime is not None:
+            connect_result = await self.runtime.initialize_mcp()
+            manager = self.runtime.mcp_manager
+        else:
+            manager = MCPManager()
+            manager.load_configs(self._mcp_server_configs)
+            connect_result = await manager.register_all_tools(self.registry)
         self.mcp_manager = manager
         self._mcp_connecting = False
         self._update_mode_label()
@@ -2055,6 +2119,8 @@ class BraincodeApp(App):
                 "for how to use their tools and resources:\n\n"
                 + "\n\n".join(parts)
             )
+        if self.agent is not None:
+            self.agent.set_mcp_prompt_state(self._mcp_instructions)
 
     async def _shutdown_mcp(self) -> None:
         if self._mcp_init_task is not None:
@@ -2098,19 +2164,10 @@ class BraincodeApp(App):
                 tasks.append(asyncio.create_task(
                     self.agent._extract_memories(self.conversation)
                 ))
-            if self.hook_engine:
-                tasks.append(asyncio.create_task(
-                    self.hook_engine.run_hooks(
-                        "shutdown", HookContext(event_name="shutdown")
-                    )
-                ))
-            tasks.append(asyncio.create_task(self._shutdown_mcp()))
-            if self.scheduler is not None:
-                tasks.append(asyncio.create_task(self.scheduler.stop()))
-            if self.tool_job_runner is not None:
-                tasks.append(asyncio.create_task(self.tool_job_runner.stop()))
-            if self.prompt_job_runner is not None:
-                tasks.append(asyncio.create_task(self.prompt_job_runner.stop()))
+            if self.runtime is not None:
+                tasks.append(asyncio.create_task(self.runtime.shutdown()))
+            else:
+                tasks.append(asyncio.create_task(self._shutdown_mcp()))
 
             if tasks:
                 await asyncio.wait(tasks, timeout=3.0)
@@ -2118,20 +2175,7 @@ class BraincodeApp(App):
                     if not t.done():
                         t.cancel()
 
-            if self._stale_cleanup_task and not self._stale_cleanup_task.done():
-                self._stale_cleanup_task.cancel()
-
-            if hasattr(self, 'team_manager'):
-                for name in list(self.team_manager._teams):
-                    try:
-                        team = self.team_manager._teams[name]
-                        for m in team.members:
-                            team.set_member_active(m.name, False)
-                        self.team_manager.delete_team(name)
-                    except Exception:
-                        pass
-
-            if self.session:
+            if self.runtime is None and self.session:
                 self.session.close()
 
         try:

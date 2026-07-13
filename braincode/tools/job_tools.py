@@ -149,10 +149,12 @@ class JobCancelTool(Tool):
         manager: JobManager,
         tool_runner: BackgroundToolRunner | None = None,
         prompt_runner: PromptJobRunner | None = None,
+        task_manager: Any = None,
     ) -> None:
         self.manager = manager
         self.tool_runner = tool_runner
         self.prompt_runner = prompt_runner
+        self.task_manager = task_manager
 
     async def execute(self, params: BaseModel) -> ToolResult:
         p: JobCancelParams = params  # type: ignore[assignment]

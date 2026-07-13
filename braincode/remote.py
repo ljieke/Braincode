@@ -128,6 +128,12 @@ class RemoteServer:
         self.scheduler = None
         self.tool_job_runner = None
         self.prompt_job_runner = None
+        self.runtime = None
+        self.worktree_manager = None
+        self.team_manager = None
+        self.task_manager = None
+        self.trace_manager = None
+        self.agent_loader = None
 
     # ------------------------------------------------------------------
     # 启动入口
@@ -154,14 +160,8 @@ class RemoteServer:
             ):
                 await asyncio.Future()
         finally:
-            if self.scheduler is not None:
-                await self.scheduler.stop()
-            if self.tool_job_runner is not None:
-                await self.tool_job_runner.stop()
-            if self.prompt_job_runner is not None:
-                await self.prompt_job_runner.stop()
-            if self.mcp_manager is not None:
-                await self.mcp_manager.shutdown()
+            if self.runtime is not None:
+                await self.runtime.shutdown()
 
     # ------------------------------------------------------------------
     # HTTP 请求处理（为 / 路径提供前端 HTML）
@@ -394,6 +394,109 @@ class RemoteServer:
                 self._scheduler_config.default_overlap_policy
             ),
         )
+        from braincode.prompt_state import (
+            CronPromptStateProvider,
+            JobPromptStateProvider,
+            TeamPromptStateProvider,
+            WorktreePromptStateProvider,
+        )
+        self.agent.register_prompt_state_provider(
+            JobPromptStateProvider(self.job_manager)
+        )
+        self.agent.register_prompt_state_provider(
+            CronPromptStateProvider(self.scheduler)
+        )
+        from braincode.agents.loader import AgentLoader
+        from braincode.agents.task_manager import TaskManager
+        from braincode.agents.trace import TraceManager
+        from braincode.runtime import RuntimeContainer
+        from braincode.teams.manager import TeamManager
+        from braincode.tools.agent_tool import AgentTool
+        from braincode.tools.team_create import TeamCreateTool
+        from braincode.tools.team_delete import TeamDeleteTool
+        from braincode.worktree import WorktreeManager
+
+        self.worktree_manager = WorktreeManager(repo_root=work_dir)
+        restored = self.worktree_manager.restore_session()
+        if restored is not None:
+            self.agent.work_dir = restored.worktree_path
+        self.task_manager = TaskManager(self.job_manager)
+        self.trace_manager = TraceManager()
+        self.agent_loader = AgentLoader(work_dir)
+        self.agent_loader.load_all()
+        self.team_manager = TeamManager(
+            worktree_manager=self.worktree_manager,
+            trace_manager=self.trace_manager,
+            job_manager=self.job_manager,
+        )
+        self.registry.register(
+            AgentTool(
+                agent_loader=self.agent_loader,
+                task_manager=self.task_manager,
+                trace_manager=self.trace_manager,
+                parent_agent=self.agent,
+                provider_config=provider,
+                worktree_manager=self.worktree_manager,
+                team_manager=self.team_manager,
+            )
+        )
+        self.registry.register(
+            TeamCreateTool(
+                team_manager=self.team_manager,
+                parent_agent=self.agent,
+                teammate_mode="in-process",
+                is_interactive=False,
+            )
+        )
+        self.registry.register(
+            TeamDeleteTool(
+                team_manager=self.team_manager,
+                parent_agent=self.agent,
+            )
+        )
+        self.agent._team_manager = self.team_manager
+        self.agent.notification_fn = self.team_manager.drain_lead_mailbox
+        self.agent.register_prompt_state_provider(
+            WorktreePromptStateProvider(self.worktree_manager)
+        )
+        self.agent.register_prompt_state_provider(
+            TeamPromptStateProvider(self.team_manager)
+        )
+        self.runtime = RuntimeContainer.adopt(
+            client=client,
+            agent=self.agent,
+            registry=self.registry,
+            permission_checker=checker,
+            job_manager=self.job_manager,
+            scheduler=self.scheduler,
+            team_manager=self.team_manager,
+            worktree_manager=self.worktree_manager,
+            hook_engine=self.hook_engine,
+            tool_job_runner=self.tool_job_runner,
+            prompt_job_runner=self.prompt_job_runner,
+            task_manager=self.task_manager,
+            trace_manager=self.trace_manager,
+            memory_manager=self.memory_manager,
+            session_manager=self.session_manager,
+            session=self.session,
+            skill_loader=self.skill_loader,
+            agent_loader=self.agent_loader,
+            load_skill_tool=load_skill_tool,
+            mcp_configs=self._mcp_server_configs,
+        )
+        self.runtime.event_bus.subscribe(self._on_runtime_event)
+
+        from braincode.commands.handlers.cron import create_cron_command
+        from braincode.commands.handlers.jobs import create_jobs_command
+        self.command_registry.register_sync(
+            create_jobs_command(
+                self.job_manager,
+                self.tool_job_runner,
+                self.prompt_job_runner,
+                self.task_manager,
+            )
+        )
+        self.command_registry.register_sync(create_cron_command(self.scheduler))
         if bash_tool is not None:
             bash_tool.background_runner = self.tool_job_runner
         for job_tool in (
@@ -442,9 +545,13 @@ class RemoteServer:
         if not self._mcp_server_configs or self.registry is None:
             return
 
-        manager = MCPManager()
-        manager.load_configs(self._mcp_server_configs)
-        connect_result = await manager.register_all_tools(self.registry)
+        if self.runtime is not None:
+            connect_result = await self.runtime.initialize_mcp()
+            manager = self.runtime.mcp_manager
+        else:
+            manager = MCPManager()
+            manager.load_configs(self._mcp_server_configs)
+            connect_result = await manager.register_all_tools(self.registry)
         self.mcp_manager = manager
 
         for err in connect_result.errors:
@@ -471,6 +578,8 @@ class RemoteServer:
                 "for how to use their tools and resources:\n\n"
                 + "\n\n".join(parts)
             )
+        if self.agent is not None:
+            self.agent.set_mcp_prompt_state(self._mcp_instructions)
 
     # ------------------------------------------------------------------
     # 用户消息处理
@@ -492,11 +601,6 @@ class RemoteServer:
         assert self.agent is not None
 
         self.conversation.add_user_message(content)
-
-        # 首次注入 MCP 指令
-        if self._mcp_instructions:
-            self.conversation.add_system_reminder(self._mcp_instructions)
-            self._mcp_instructions = ""
 
         # 创建取消事件
         self._cancel_event = asyncio.Event()
@@ -775,6 +879,16 @@ class RemoteServer:
             "type": "system",
             "data": {"message": text},
         }))
+
+    def _on_runtime_event(self, event) -> None:
+        asyncio.create_task(
+            self._broadcast(
+                {
+                    "type": "runtime_event",
+                    "data": event.to_dict(),
+                }
+            )
+        )
 
     def send_user_message(self, text: str) -> None:
         """同步接口 — 注入用户消息并触发 agent。"""

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from braincode.commands.registry import Command, CommandContext, CommandType
 from braincode.jobs import (
     BackgroundToolRunner,
@@ -18,6 +20,24 @@ def create_jobs_command(
 ) -> Command:
     async def handler(ctx: CommandContext) -> None:
         parts = ctx.args.strip().split(maxsplit=1)
+        if parts and parts[0] == "output":
+            if len(parts) != 2:
+                ctx.ui.add_system_message("用法: /jobs output <job-id>")
+                return
+            job = manager.store.get(parts[1])
+            if job is None:
+                ctx.ui.add_system_message(f"未找到 Job: {parts[1]}")
+                return
+            output_path = (
+                Path(manager.store.database).parent
+                / "job-output"
+                / f"{job.id}.txt"
+            )
+            if not output_path.is_file():
+                ctx.ui.add_system_message(f"Job 没有持久化大输出: {parts[1]}")
+                return
+            ctx.ui.add_system_message(output_path.read_text(encoding="utf-8"))
+            return
         if parts and parts[0] == "cancel":
             if len(parts) != 2:
                 ctx.ui.add_system_message("用法: /jobs cancel <job-id>")
@@ -55,5 +75,5 @@ def create_jobs_command(
         description="查看和取消持久 Job",
         type=CommandType.LOCAL,
         handler=handler,
-        usage="/jobs [cancel <job-id>]",
+        usage="/jobs [cancel <job-id> | output <job-id>]",
     )

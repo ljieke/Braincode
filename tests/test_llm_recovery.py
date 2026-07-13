@@ -306,11 +306,15 @@ async def test_agent_run_emits_observable_retry_event() -> None:
         [client],
         policy=RetryPolicy(base_delay_seconds=0, max_delay_seconds=0),
     )
+    runtime_events: list[tuple[str, dict]] = []
     agent = Agent(
         client=client,
         registry=create_default_registry(),
         protocol="anthropic",
         recovery_controller=controller,
+        runtime_event_sink=lambda event_type, payload: runtime_events.append(
+            (event_type, payload)
+        ),
     )
 
     events = [event async for event in agent.run(ConversationManager())]
@@ -319,4 +323,6 @@ async def test_agent_run_emits_observable_retry_event() -> None:
     assert retry.reason == "temporary"
     assert retry.attempt == 1
     assert retry.provider_name == "primary"
+    assert runtime_events[0][0] == "retry_started"
+    assert runtime_events[0][1]["reason"] == "temporary"
     assert any(isinstance(event, StreamText) and event.text == "ok" for event in events)

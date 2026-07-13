@@ -327,11 +327,17 @@ def build_system_prompt(
     custom_instructions: str = "",
     skill_section: str = "",
     memory_section: str = "",
+    prompt_state: str = "",
     work_dir: str = ".",
 ) -> str:
     if coordinator_mode:
         from braincode.teams.coordinator import get_coordinator_system_prompt
-        return get_coordinator_system_prompt(agent_catalog=agent_catalog)
+        result = get_coordinator_system_prompt(agent_catalog=agent_catalog)
+        if prompt_state:
+            result += "\n\n" + prompt_state.strip()
+        if hook_prompts:
+            result += "\n\n# Hook Injected Context\n" + "\n".join(hook_prompts)
+        return result
 
     b = PromptBuilder()
     b.add(IDENTITY_SECTION)
@@ -355,6 +361,13 @@ def build_system_prompt(
 
     if memory_section:
         b.add(PromptSection(name="Memory", priority=95, content=memory_section))
+
+    if prompt_state:
+        b.add(PromptSection(
+            name="RuntimeState",
+            priority=100,
+            content=prompt_state,
+        ))
 
     result = b.build()
 

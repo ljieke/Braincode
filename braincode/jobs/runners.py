@@ -74,7 +74,7 @@ class BackgroundToolRunner:
             )
         )
         if decision.effect != "allow":
-            return self.manager.store.mark_failed(
+            return self.manager.mark_failed(
                 job.id,
                 f"Background tool permission {decision.effect}: {decision.reason}",
             )
@@ -153,21 +153,21 @@ class BackgroundToolRunner:
             payload = json.loads(job.payload_json)
             cwd = Path(payload.get("cwd") or self.work_dir)
             if not cwd.is_dir():
-                self.manager.store.mark_failed(
+                self.manager.mark_failed(
                     job_id, f"Background tool cwd no longer exists: {cwd}"
                 )
                 return
             tool_name = str(payload.get("tool_name", ""))
             tool = self.registry.get(tool_name)
             if tool is None or not self.registry.is_enabled(tool_name):
-                self.manager.store.mark_failed(job_id, f"Tool '{tool_name}' is unavailable")
+                self.manager.mark_failed(job_id, f"Tool '{tool_name}' is unavailable")
                 return
             arguments = payload.get("arguments", {})
             if "run_in_background" in arguments:
                 arguments["run_in_background"] = False
             decision = self.permission_checker.check(tool, arguments)
             if decision.effect != "allow":
-                self.manager.store.mark_failed(
+                self.manager.mark_failed(
                     job_id,
                     f"Background tool permission {decision.effect}: {decision.reason}",
                 )
@@ -192,7 +192,7 @@ class BackgroundToolRunner:
         except Exception as exc:
             job = self.manager.store.get(job_id)
             if job is not None and not job.is_terminal:
-                self.manager.store.mark_failed(job_id, str(exc))
+                self.manager.mark_failed(job_id, str(exc))
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
@@ -283,7 +283,7 @@ class PromptJobRunner:
         except Exception as exc:
             job = self.manager.store.get(job_id)
             if job is not None and not job.is_terminal:
-                self.manager.store.mark_failed(job_id, str(exc))
+                self.manager.mark_failed(job_id, str(exc))
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()

@@ -41,6 +41,14 @@ from braincode.permissions import (
 )
 from braincode.hooks import HookContext, HookEngine, HookResult
 from braincode.prompts import build_environment_context, build_plan_mode_reminder, build_system_prompt
+from braincode.prompt_state import (
+    MemoryPromptStateProvider,
+    MCPPromptStateProvider,
+    PromptStateProvider,
+    PromptStateRegistry,
+    RecoveryPromptStateProvider,
+    SkillsPromptStateProvider,
+)
 from braincode.recovery import RecoveryController, RecoveryNotice
 from braincode.tools import ToolRegistry
 from braincode.tools.base import (
@@ -324,6 +332,8 @@ class Agent:
         memory_manager: MemoryManager | None = None,
         hook_engine: HookEngine | None = None,
         recovery_controller: RecoveryController | None = None,
+        prompt_state_registry: PromptStateRegistry | None = None,
+        runtime_event_sink: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -343,6 +353,19 @@ class Agent:
         # auto_compact 触发阈值时消费。
         self.recovery_state: RecoveryState = RecoveryState()
         self.recovery_controller = recovery_controller or RecoveryController([client])
+        self.prompt_state_registry = prompt_state_registry or PromptStateRegistry()
+        self._skills_prompt_provider = SkillsPromptStateProvider()
+        self._mcp_prompt_provider = MCPPromptStateProvider()
+        self.prompt_state_registry.register(self._skills_prompt_provider)
+        self.prompt_state_registry.register(self._mcp_prompt_provider)
+        if memory_manager is not None:
+            self.prompt_state_registry.register(
+                MemoryPromptStateProvider(memory_manager)
+            )
+        self.prompt_state_registry.register(
+            RecoveryPromptStateProvider(self.recovery_controller)
+        )
+        self.runtime_event_sink = runtime_event_sink
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.instructions_content = instructions_content
@@ -420,6 +443,19 @@ class Agent:
 
     def set_skill_catalog(self, catalog: str) -> None:
         self._skill_catalog = catalog
+        self._skills_prompt_provider.set_content(catalog)
+
+    def set_mcp_prompt_state(self, content: str) -> None:
+        self._mcp_prompt_provider.set_content(content)
+
+    def register_prompt_state_provider(
+        self, provider: PromptStateProvider
+    ) -> None:
+        self.prompt_state_registry.register(provider)
+
+    def _emit_runtime_event(self, event_type: str, **payload: Any) -> None:
+        if self.runtime_event_sink is not None:
+            self.runtime_event_sink(event_type, payload)
 
 
     def set_agent_catalog(self, catalog: str, catalog_list: list[tuple[str, str]] | None = None) -> None:
@@ -490,17 +526,32 @@ class Agent:
         )
         arguments = dict(tc.arguments)
         if hook_result.updated_args:
+            original_arguments = dict(tc.arguments)
             arguments.update(hook_result.updated_args)
             tc = ToolCallComplete(
                 tool_id=tc.tool_id,
                 tool_name=tc.tool_name,
                 arguments=arguments,
             )
+            self._emit_runtime_event(
+                "hook_modified_input",
+                hook_event="pre_tool_use",
+                tool_name=tc.tool_name,
+                original_args=original_arguments,
+                updated_args=hook_result.updated_args,
+                final_args=arguments,
+            )
         if hook_result.is_rejected:
             reason = (
                 hook_result.reject_reason
                 or hook_result.message
                 or "Hook rejected tool call"
+            )
+            self._emit_runtime_event(
+                "hook_rejected",
+                hook_event="pre_tool_use",
+                tool_name=tc.tool_name,
+                reason=reason,
             )
             return tc, ToolResult(output=f"Hook rejected: {reason}", is_error=True)
         return tc, None
@@ -550,6 +601,7 @@ class Agent:
             file_path=self._infer_file_path(tc.arguments),
         )
         if hook_result.updated_args:
+            original_arguments = dict(tc.arguments)
             arguments = dict(tc.arguments)
             arguments.update(hook_result.updated_args)
             tc = ToolCallComplete(
@@ -558,11 +610,25 @@ class Agent:
                 arguments=arguments,
             )
             decision = self.permission_checker.check(tool, tc.arguments)
+            self._emit_runtime_event(
+                "hook_modified_input",
+                hook_event="permission_request",
+                tool_name=tc.tool_name,
+                original_args=original_arguments,
+                updated_args=hook_result.updated_args,
+                final_args=arguments,
+            )
         if hook_result.is_rejected:
             reason = (
                 hook_result.reject_reason
                 or hook_result.message
                 or "permission request cancelled"
+            )
+            self._emit_runtime_event(
+                "hook_rejected",
+                hook_event="permission_request",
+                tool_name=tc.tool_name,
+                reason=reason,
             )
             return tc, decision, ToolResult(
                 output=f"Permission denied by Hook: {reason}",
@@ -580,12 +646,11 @@ class Agent:
                 yield he
 
         env_context = build_environment_context(
-            self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
+            self.work_dir, self.active_skills, "", self._agent_catalog
         )
         conversation.inject_environment(env_context)
 
-        memory_content = self.memory_manager.load() if self.memory_manager else ""
-        conversation.inject_long_term_memory(self.instructions_content, memory_content)
+        conversation.inject_long_term_memory(self.instructions_content, "")
 
         if self.hook_engine:
             await self._run_hook_event("session_start", message=user_message)
@@ -635,6 +700,7 @@ class Agent:
                 hook_prompts=hook_prompts,
                 coordinator_mode=self.coordinator_mode,
                 agent_catalog=self._agent_catalog_list or None,
+                prompt_state=self.prompt_state_registry.render(),
             )
 
             if self.plan_mode:
@@ -691,9 +757,8 @@ class Agent:
                     boundary=compact_result.boundary,
                 )
                 conversation.inject_environment(env_context)
-                mem = self.memory_manager.load() if self.memory_manager else ""
                 conversation.inject_long_term_memory(
-                    self.instructions_content, mem
+                    self.instructions_content, ""
                 )
                 # 压缩后重新应用 budget（就地修改）
                 apply_tool_result_budget(
@@ -713,6 +778,16 @@ class Agent:
                 context_recover=lambda: self._recover_context_limit(conversation),
             )
             async for event in collector.consume(llm_stream):
+                if isinstance(event, RetryEvent):
+                    self._emit_runtime_event(
+                        "provider_switched"
+                        if event.provider_switched
+                        else "retry_started",
+                        reason=event.reason,
+                        attempt=event.attempt,
+                        wait=event.wait,
+                        provider=event.provider_name,
+                    )
                 # 流式工具执行：收到完整 tool_use 就立刻提交执行，不等整个响应结束
                 if isinstance(event, ToolUseEvent):
                     tc = collector.response.tool_calls[-1]
@@ -779,7 +854,11 @@ class Agent:
                             "Output token limit hit. Resume directly from where you stopped. "
                             "Do not apologize or repeat previous content. Pick up mid-thought if needed."
                         )
-                    yield RetryEvent(reason="max_tokens escalation")
+                    retry_event = RetryEvent(reason="max_tokens escalation")
+                    self._emit_runtime_event(
+                        "retry_started", reason=retry_event.reason, attempt=0, wait=0.0
+                    )
+                    yield retry_event
                     continue
                 elif output_recoveries < self.recovery_controller.policy.max_output_continuations:
                     output_recoveries += 1
@@ -791,12 +870,16 @@ class Agent:
                         "Output token limit hit. Resume directly from where you stopped. "
                         "Break remaining work into smaller pieces."
                     )
-                    yield RetryEvent(
+                    retry_event = RetryEvent(
                         reason=(
                             f"max_tokens recovery {output_recoveries}/"
                             f"{self.recovery_controller.policy.max_output_continuations}"
                         )
                     )
+                    self._emit_runtime_event(
+                        "retry_started", reason=retry_event.reason, attempt=0, wait=0.0
+                    )
+                    yield retry_event
                     continue
             else:
                 output_recoveries = 0
@@ -1233,12 +1316,11 @@ class Agent:
         )
         if isinstance(result, CompactEvent):
             env_context = build_environment_context(
-            self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
-        )
+                self.work_dir, self.active_skills, "", self._agent_catalog
+            )
             conversation.inject_environment(env_context)
-            memory_content = self.memory_manager.load() if self.memory_manager else ""
             conversation.inject_long_term_memory(
-                self.instructions_content, memory_content
+                self.instructions_content, ""
             )
             return CompactNotification(
                 before_tokens=result.before_tokens,
@@ -1252,16 +1334,15 @@ class Agent:
         event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         env_context = build_environment_context(
-            self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
+            self.work_dir, self.active_skills, "", self._agent_catalog
         )
         if conversation is None:
             conversation = ConversationManager()
             conversation.inject_environment(env_context)
 
             if self.instructions_content:
-                memory_content = self.memory_manager.load() if self.memory_manager else ""
                 conversation.inject_long_term_memory(
-                    self.instructions_content, memory_content
+                    self.instructions_content, ""
                 )
 
         if task:
@@ -1316,6 +1397,7 @@ class Agent:
             system = build_system_prompt(
                 hook_prompts=hook_prompts,
                 coordinator_mode=self.coordinator_mode,
+                prompt_state=self.prompt_state_registry.render(),
             )
 
             # 先应用 tool-result budget（就地修改），再做 auto-compact，确保预算内的结果不会被误压缩
@@ -1364,17 +1446,27 @@ class Agent:
                 context_recover=lambda: self._recover_context_limit(conversation),
             )
             async for _event in collector.consume(llm_stream):
-                if isinstance(_event, RetryEvent) and event_callback:
-                    event_callback(
-                        {
-                            "type": "retry",
-                            "reason": _event.reason,
-                            "attempt": _event.attempt,
-                            "wait": _event.wait,
-                            "provider": _event.provider_name,
-                            "providerSwitched": _event.provider_switched,
-                        }
+                if isinstance(_event, RetryEvent):
+                    self._emit_runtime_event(
+                        "provider_switched"
+                        if _event.provider_switched
+                        else "retry_started",
+                        reason=_event.reason,
+                        attempt=_event.attempt,
+                        wait=_event.wait,
+                        provider=_event.provider_name,
                     )
+                    if event_callback:
+                        event_callback(
+                            {
+                                "type": "retry",
+                                "reason": _event.reason,
+                                "attempt": _event.attempt,
+                                "wait": _event.wait,
+                                "provider": _event.provider_name,
+                                "providerSwitched": _event.provider_switched,
+                            }
+                        )
 
             response = collector.response
             self.client = self.recovery_controller.current_client
@@ -1422,6 +1514,12 @@ class Agent:
                             "Output token limit hit. Resume directly from where you stopped. "
                             "Do not apologize or repeat previous content."
                         )
+                    self._emit_runtime_event(
+                        "retry_started",
+                        reason="max_tokens escalation",
+                        attempt=0,
+                        wait=0.0,
+                    )
                     if event_callback:
                         event_callback(
                             {"type": "retry", "reason": "max_tokens escalation"}
@@ -1435,15 +1533,22 @@ class Agent:
                         "Output token limit hit. Resume directly from where you stopped. "
                         "Break remaining work into smaller pieces."
                     )
+                    continuation_reason = (
+                        "max_tokens recovery "
+                        f"{output_recoveries}/"
+                        f"{self.recovery_controller.policy.max_output_continuations}"
+                    )
+                    self._emit_runtime_event(
+                        "retry_started",
+                        reason=continuation_reason,
+                        attempt=output_recoveries,
+                        wait=0.0,
+                    )
                     if event_callback:
                         event_callback(
                             {
                                 "type": "retry",
-                                "reason": (
-                                    "max_tokens recovery "
-                                    f"{output_recoveries}/"
-                                    f"{self.recovery_controller.policy.max_output_continuations}"
-                                ),
+                                "reason": continuation_reason,
                             }
                         )
                     continue

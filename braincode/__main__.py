@@ -132,6 +132,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     )
     from braincode.client import create_client, resolve_context_window
     from braincode.conversation import ConversationManager
+    from braincode.memory import MemoryManager
     from braincode.memory.instructions import load_instructions
     from braincode.permissions import (
         DangerousCommandDetector,
@@ -199,6 +200,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     )
 
     instructions = load_instructions(work_dir)
+    memory_manager = MemoryManager(work_dir)
     registry = create_default_registry()
     registry.register(ToolSearchTool(registry, protocol=provider.protocol))
     bash_tool = registry.get("Bash")
@@ -226,6 +228,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         permission_checker=checker,
         context_window=provider.get_context_window(),
         instructions_content=instructions,
+        memory_manager=memory_manager,
         hook_engine=hook_engine,
         recovery_controller=build_recovery_controller(
             client, config.providers, config.recovery
@@ -259,6 +262,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
             permission_checker=checker,
             context_window=provider.get_context_window(),
             instructions_content=instructions,
+            memory_manager=memory_manager,
             hook_engine=hook_engine,
             recovery_controller=build_recovery_controller(
                 scheduled_client, config.providers, config.recovery
@@ -294,6 +298,14 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
             config.scheduler.default_overlap_policy
         ),
     )
+    from braincode.prompt_state import (
+        CronPromptStateProvider,
+        JobPromptStateProvider,
+        TeamPromptStateProvider,
+        WorktreePromptStateProvider,
+    )
+    agent.register_prompt_state_provider(JobPromptStateProvider(job_manager))
+    agent.register_prompt_state_provider(CronPromptStateProvider(scheduler))
     if bash_tool is not None:
         bash_tool.background_runner = tool_job_runner
     for job_tool in (
@@ -319,6 +331,8 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         trace_manager=trace_manager,
         job_manager=job_manager,
     )
+    agent.register_prompt_state_provider(WorktreePromptStateProvider(wt_manager))
+    agent.register_prompt_state_provider(TeamPromptStateProvider(team_manager))
 
     agent_tool = AgentTool(
         agent_loader=agent_loader,
@@ -355,6 +369,44 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         return team_manager.drain_lead_mailbox()
 
     agent.notification_fn = drain_mailbox_only
+
+    from braincode.runtime import RuntimeContainer
+    runtime = RuntimeContainer.adopt(
+        client=client,
+        agent=agent,
+        registry=registry,
+        permission_checker=checker,
+        job_manager=job_manager,
+        scheduler=scheduler,
+        team_manager=team_manager,
+        worktree_manager=wt_manager,
+        hook_engine=hook_engine,
+        tool_job_runner=tool_job_runner,
+        prompt_job_runner=prompt_job_runner,
+        task_manager=task_manager,
+        trace_manager=trace_manager,
+        memory_manager=memory_manager,
+        agent_loader=agent_loader,
+        mcp_configs=config.mcp_servers,
+    )
+
+    def on_runtime_event(event) -> None:
+        if is_json:
+            emit_json({"type": "runtime_event", "event": event.to_dict()})
+        elif event.type.value in {"retry_started", "provider_switched"}:
+            print(
+                f"[{event.type.value}] {event.payload.get('reason', '')}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    runtime.event_bus.subscribe(on_runtime_event)
+    mcp_result = await runtime.initialize_mcp()
+    for error in mcp_result.errors:
+        if is_json:
+            emit_json({"type": "error", "message": error})
+        else:
+            print(f"MCP warning: {error}", file=sys.stderr, flush=True)
 
     # 使用事件驱动的 agent.run()，支持 text 和 stream-json 两种输出格式
     conv = ConversationManager()
@@ -445,15 +497,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
                 emit_json({"type": "compact", "message": event.message})
 
         elif isinstance(event, RetryEvent):
-            if is_json:
-                emit_json({
-                    "type": "retry",
-                    "reason": event.reason,
-                    "attempt": event.attempt,
-                    "wait": event.wait,
-                    "provider": event.provider_name,
-                    "provider_switched": event.provider_switched,
-                })
+            pass  # RuntimeEventBus owns retry/provider output.
 
         elif isinstance(event, PermissionRequest):
             # -p 非交互模式：自动批准所有权限请求
@@ -461,9 +505,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
 
     # 如果有 team 在运行，轮询等待 teammate 完成
     if not team_manager._teams:
-        await scheduler.stop()
-        await tool_job_runner.stop()
-        await prompt_job_runner.stop()
+        await runtime.shutdown()
         return
 
     for i in range(90):
@@ -489,9 +531,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         else:
             print(last_result, flush=True)
 
-    await scheduler.stop()
-    await tool_job_runner.stop()
-    await prompt_job_runner.stop()
+    await runtime.shutdown()
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 # 简历模版：jianli.xiaolinnote.com
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -268,6 +269,21 @@ class TeamManager:
         member = next((m for m in team.members if m.agent_id == agent_id), None)
         if member:
             self.set_member_idle(team_name, member.name)
+
+    async def shutdown(self) -> None:
+        tasks = []
+        for handle in self._inprocess_handles.values():
+            if not handle.done:
+                handle.cancel()
+                tasks.append(handle.task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for team in self._teams.values():
+            for member in team.members:
+                if member.is_active is not False:
+                    team.set_member_active(member.name, False)
+            if team.config_path:
+                team.save()
 
 
     def _kill_pane(self, pane_id: str, backend_type: str) -> None:

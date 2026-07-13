@@ -4,7 +4,7 @@ import json
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from braincode.jobs.models import (
     Job,
@@ -37,20 +37,41 @@ class JobManager:
         *,
         owner: str | None = None,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        event_sink: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         self.store = store
         self.owner = owner or f"runtime-{uuid.uuid4().hex}"
         self.lease_seconds = lease_seconds
+        self.event_sink = event_sink
 
     @classmethod
-    def for_project(cls, project_dir: str | Path) -> JobManager:
+    def for_project(
+        cls,
+        project_dir: str | Path,
+        *,
+        event_sink: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> JobManager:
         database = Path(project_dir) / ".braincode" / "runtime.db"
-        return cls(SQLiteJobStore(database))
+        return cls(SQLiteJobStore(database), event_sink=event_sink)
+
+    def _emit(self, event_type: str, job: Job, **extra: Any) -> None:
+        if self.event_sink is None:
+            return
+        payload = {
+            "job_id": job.id,
+            "kind": job.kind.value,
+            "name": job.name,
+            "status": job.status.value,
+            **extra,
+        }
+        self.event_sink(event_type, payload)
 
     def create(self, spec: JobSpec) -> Job:
-        return self.store.create(spec)
+        job = self.store.create(spec)
+        self._emit("job_created", job)
+        return job
 
     def create_schedule(self, spec: ScheduleSpec) -> Schedule:
         next_run = CronExpression.parse(spec.cron_expression).next_after(
@@ -92,24 +113,40 @@ class JobManager:
         )
 
     def claim(self, job_id: str) -> Job | None:
-        return self.store.claim(job_id, self.owner, self.lease_seconds)
+        job = self.store.claim(job_id, self.owner, self.lease_seconds)
+        if job is not None:
+            self._emit("job_started", job)
+        return job
 
     def heartbeat(self, job_id: str) -> bool:
         return self.store.heartbeat(job_id, self.owner, self.lease_seconds)
 
     def complete(self, job_id: str, result: str) -> Job:
-        return self.store.complete(job_id, self.owner, result)
+        job = self.store.complete(job_id, self.owner, result)
+        self._emit("job_completed", job, result=result)
+        return job
 
     def fail(self, job_id: str, error: str) -> Job:
-        return self.store.fail(job_id, self.owner, error)
+        job = self.store.fail(job_id, self.owner, error)
+        self._emit("job_failed", job, error=error)
+        return job
 
     def cancel(self, job_id: str) -> Job:
-        return self.store.cancel(job_id)
+        job = self.store.cancel(job_id)
+        self._emit("job_cancelled", job)
+        return job
 
     def update_progress(self, job_id: str, progress: dict[str, Any]) -> Job:
-        return self.store.update_progress(
+        job = self.store.update_progress(
             job_id, json.dumps(progress, ensure_ascii=False, sort_keys=True)
         )
+        self._emit("job_progress", job, progress=progress)
+        return job
+
+    def mark_failed(self, job_id: str, error: str) -> Job:
+        job = self.store.mark_failed(job_id, error)
+        self._emit("job_failed", job, error=error)
+        return job
 
     def append_event(
         self, job_id: str, event_type: str, payload: dict[str, Any] | None = None
@@ -170,7 +207,7 @@ class JobManager:
                     "Agent runtime state is unavailable after restart; "
                     "the job cannot be resumed safely"
                 )
-            recovered.append(self.store.mark_failed(job.id, reason))
+            recovered.append(self.mark_failed(job.id, reason))
         return recovered
 
     def ensure_team_task_running(self, job_id: str, owner: str) -> Job | None:

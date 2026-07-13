@@ -300,6 +300,14 @@ class TaskManager:
             return True
         return False
 
+    async def shutdown(self) -> None:
+        tasks = [task for task in self._async_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._async_tasks.clear()
+
     def poll_completed(self) -> list[BackgroundTask]:
         if self._job_manager is not None:
             self._job_manager.recover_agent_jobs()
