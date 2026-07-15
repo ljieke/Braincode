@@ -88,8 +88,12 @@ class Mailbox:
                 last_err = e
                 break
 
-        if lock_fd is None and last_err is not None:
-            raise last_err
+        if lock_fd is None:
+            if last_err is not None:
+                raise last_err
+            raise TimeoutError(
+                f"Failed to acquire mailbox lock after 10 attempts: {lock_file}"
+            )
 
         try:
             messages = self._read_inbox(agent_id)

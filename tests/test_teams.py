@@ -303,6 +303,21 @@ class TestMailbox:
         assert mailbox.consume("nonexistent") == []
         assert mailbox.read("nonexistent") == []
 
+    def test_lock_retry_exhaustion_does_not_write_or_remove_foreign_lock(
+        self, tmp_dir, monkeypatch
+    ):
+        mailbox = Mailbox(tmp_dir)
+        lock_path = Path(tmp_dir) / "agent-1.json.lock"
+        lock_path.write_text("held by another process", encoding="utf-8")
+        monkeypatch.setattr("braincode.teams.mailbox.time.sleep", lambda _seconds: None)
+
+        message = create_message("alice", "agent-1", "must not be written")
+        with pytest.raises(TimeoutError, match="Failed to acquire mailbox lock"):
+            mailbox.write("agent-1", message)
+
+        assert lock_path.exists()
+        assert not (Path(tmp_dir) / "agent-1.json").exists()
+
 # =====================================================================
 # 4. AgentNameRegistry
 # =====================================================================
