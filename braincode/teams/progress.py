@@ -74,7 +74,7 @@ def _describe(tool_name: str, args: dict) -> str:
 class TeammateProgress:
     name: str
     team_name: str
-    status: str = "running"
+    status: str = "created"
     tool_use_count: int = 0
     token_count: int = 0
     last_activity: Optional[ToolActivity] = None

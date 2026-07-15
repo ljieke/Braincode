@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from braincode.teams.backend_detect import BackendDetectionError, detect_backend
+from braincode.teams.lifecycle import TeammateState, is_executing, is_terminal
 from braincode.teams.mailbox import Mailbox, create_message
 from braincode.teams.models import (
     AgentTeam,
@@ -148,14 +149,84 @@ class TeamManager:
 
         AgentNameRegistry.instance().register(member.name, member.agent_id)
         self._teammate_team_map[member.agent_id] = team_name
+        if self._trace_manager is not None:
+            self._trace_manager.update(
+                member.agent_id, status=member.state.value
+            )
         log.info("Registered member '%s' (agent=%s) in team '%s'", member.name, member.agent_id, team_name)
+
+    def transition_member(
+        self,
+        team_name: str,
+        member_name: str,
+        target: TeammateState | str,
+        reason: str = "",
+    ) -> TeammateInfo:
+        """Apply one validated lifecycle transition and persist it immediately."""
+
+        team = self.get_team(team_name)
+        if team is None:
+            raise TeamError(f"Team '{team_name}' not found")
+        member = team.get_member(member_name)
+        if member is None:
+            raise TeamError(
+                f"Teammate '{member_name}' not found in team '{team_name}'"
+            )
+
+        previous = member.state
+        changed = member.transition_to(target)
+        if changed:
+            team.save()
+            if self._trace_manager is not None:
+                if is_terminal(member.state):
+                    self._trace_manager.complete(
+                        member.agent_id, member.state.value
+                    )
+                else:
+                    self._trace_manager.update(
+                        member.agent_id, status=member.state.value
+                    )
+            log.info(
+                "Teammate lifecycle %s/%s: %s -> %s (%s)",
+                team_name,
+                member.name,
+                previous.value,
+                member.state.value,
+                reason or "no reason provided",
+            )
+        return member
+
+    def observe_member_state(
+        self,
+        team_name: str,
+        member_name: str,
+        target: TeammateState | str,
+        reason: str = "",
+    ) -> TeammateInfo | None:
+        """Lifecycle callback that tolerates a concurrently deleted team."""
+
+        try:
+            return self.transition_member(
+                team_name, member_name, target, reason
+            )
+        except TeamError:
+            log.debug(
+                "Ignored lifecycle update for removed teammate %s/%s",
+                team_name,
+                member_name,
+            )
+            return None
 
     def set_member_idle(self, team_name: str, member_name: str) -> None:
         team = self.get_team(team_name)
         if team is None:
             return
-        team.set_member_active(member_name, False)
-        team.save()
+        self.transition_member(
+            team_name,
+            member_name,
+            TeammateState.IDLE,
+            "run_to_completion finished",
+        )
 
         mailbox = self.get_mailbox(team_name)
         if mailbox:
@@ -183,7 +254,7 @@ class TeamManager:
         if team is None:
             raise TeamError(f"Team '{team_name}' not found")
 
-        active = [m for m in team.members if m.is_active is not False]
+        active = team.active_members()
         if active:
             names = ", ".join(m.name for m in active)
             raise TeamError(f"Cannot delete team: active members: {names}")
@@ -193,6 +264,12 @@ class TeamManager:
 
             handle = self._inprocess_handles.pop(member.agent_id, None)
             if handle and not handle.done:
+                self.transition_member(
+                    team_name,
+                    member.agent_id,
+                    TeammateState.STOPPING,
+                    "team deletion requested",
+                )
                 handle.cancel()
 
             pane_id = self._pane_ids.pop(member.agent_id, None)
@@ -272,16 +349,26 @@ class TeamManager:
 
     async def shutdown(self) -> None:
         tasks = []
-        for handle in self._inprocess_handles.values():
+        for agent_id, handle in self._inprocess_handles.items():
             if not handle.done:
+                team_name = self.get_team_for_teammate(agent_id)
+                if team_name is not None:
+                    self.transition_member(
+                        team_name,
+                        agent_id,
+                        TeammateState.STOPPING,
+                        "runtime shutdown requested",
+                    )
                 handle.cancel()
                 tasks.append(handle.task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         for team in self._teams.values():
             for member in team.members:
-                if member.is_active is not False:
-                    team.set_member_active(member.name, False)
+                if member.state == TeammateState.STOPPING:
+                    member.transition_to(TeammateState.STOPPED)
+                elif is_executing(member.state):
+                    member.transition_to(TeammateState.FAILED)
             if team.config_path:
                 team.save()
 

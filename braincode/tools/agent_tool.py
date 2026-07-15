@@ -299,8 +299,9 @@ class AgentTool(Tool):
             PermissionMode,
             RuleEngine,
         )
+        from braincode.teams.lifecycle import TeammateState
         from braincode.teams.models import BackendType, TeammateInfo
-        from braincode.teams.registry import AgentNameRegistry
+        from braincode.teams.spawn_inprocess import spawn_inprocess_teammate
 
         team = self._team_manager.get_team(p.team_name)
         if team is None:
@@ -423,8 +424,6 @@ class AgentTool(Tool):
         sub_agent._team_manager = self._team_manager
 
         # 7. 注册名称和成员信息
-        AgentNameRegistry.instance().register(teammate_name, agent_id)
-
         member = TeammateInfo(
             name=teammate_name,
             agent_id=agent_id,
@@ -432,7 +431,7 @@ class AgentTool(Tool):
             model=p.model or definition.model,
             worktree_path=wt.path,
             backend_type=backend.value,
-            is_active=True,
+            lifecycle_state=TeammateState.CREATED.value,
         )
         self._team_manager.register_member(p.team_name, member)
 
@@ -442,13 +441,38 @@ class AgentTool(Tool):
                 p, team, member, backend, wt, agent_id, teammate_name
             )
 
-        # 进程内模式：直接用 task_manager 执行并通知结果
-        task_id = self._task_manager.launch(
+        # In-process teammates enter the persistent lifecycle loop.
+        mailbox = self._team_manager.get_mailbox(p.team_name)
+        if mailbox is None:
+            self._team_manager.transition_member(
+                p.team_name,
+                agent_id,
+                TeammateState.FAILED,
+                "mailbox unavailable during spawn",
+            )
+            return ToolResult(
+                output=f"Mailbox not found for team '{p.team_name}'.",
+                is_error=True,
+            )
+
+        handle = spawn_inprocess_teammate(
             agent=sub_agent,
-            task="" if is_fork else p.prompt,
+            prompt="" if is_fork else p.prompt,
             name=teammate_name,
-            fork_conversation=conversation if is_fork else None,
+            conversation=conversation if is_fork else None,
+            member=member,
+            team_name=p.team_name,
+            mailbox=mailbox,
+            mailbox_key=agent_id,
+            lead_agent_id=team.lead_agent_id,
+            on_state_change=lambda state, reason: self._team_manager.observe_member_state(
+                p.team_name,
+                agent_id,
+                state,
+                reason,
+            ),
         )
+        self._team_manager.register_inprocess_handle(agent_id, handle)
 
         return ToolResult(
             output=(
@@ -456,8 +480,9 @@ class AgentTool(Tool):
                 f"Agent ID: {agent_id}\n"
                 f"Backend: {backend.value}\n"
                 f"Worktree: {wt.path}\n"
-                f"Task ID: {task_id}\n"
-                f"The system will notify when it completes."
+                f"Task ID: {agent_id}\n"
+                f"Lifecycle: {member.lifecycle_state}\n"
+                f"The teammate remains available after its current task completes."
             )
         )
 
@@ -466,6 +491,7 @@ class AgentTool(Tool):
         self, p: Any, team: Any, member: Any, backend: Any, wt: Any,
         agent_id: str, teammate_name: str,
     ) -> ToolResult:
+        from braincode.teams.lifecycle import TeammateState
         from braincode.teams.models import BackendType
 
         mailbox = self._team_manager.get_mailbox(p.team_name)
@@ -497,10 +523,23 @@ class AgentTool(Tool):
                 )
         except Exception as e:
             log.warning("Pane spawn failed, falling back to in-process: %s", e)
+            self._team_manager.transition_member(
+                p.team_name,
+                agent_id,
+                TeammateState.FAILED,
+                f"pane spawn failed: {e}",
+            )
             return ToolResult(
                 output=f"Pane spawn failed ({e}), teammate not started. Retry or set teammate_mode to in-process.",
                 is_error=True,
             )
+
+        self._team_manager.transition_member(
+            p.team_name,
+            agent_id,
+            TeammateState.RUNNING,
+            f"{backend.value} pane started",
+        )
 
         return ToolResult(
             output=(

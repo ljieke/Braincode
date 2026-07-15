@@ -11,6 +11,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from braincode.teams.lifecycle import (
+    TeammateState,
+    coerce_teammate_state,
+    is_executing,
+    validate_transition,
+)
 from braincode.teams.progress import TeammateProgress
 
 
@@ -29,7 +35,41 @@ class TeammateInfo:
     worktree_path: str
     backend_type: str  # BackendType value
     is_active: bool | None = None
+    lifecycle_state: str | None = None
     progress: Optional[TeammateProgress] = None
+
+    def __post_init__(self) -> None:
+        # Migrate legacy configs that only persisted ``is_active``.  Before the
+        # lifecycle state machine, True meant executing and False meant idle.
+        if self.lifecycle_state is None:
+            if self.is_active is True:
+                state = TeammateState.RUNNING
+            elif self.is_active is False:
+                state = TeammateState.IDLE
+            else:
+                state = TeammateState.CREATED
+        else:
+            state = coerce_teammate_state(self.lifecycle_state)
+        self._apply_state(state)
+
+    @property
+    def state(self) -> TeammateState:
+        return coerce_teammate_state(self.lifecycle_state or TeammateState.CREATED)
+
+    def transition_to(self, target: TeammateState | str) -> bool:
+        current, target_state = validate_transition(self.state, target)
+        if current == target_state:
+            return False
+        self._apply_state(target_state)
+        return True
+
+    def _apply_state(self, state: TeammateState) -> None:
+        self.lifecycle_state = state.value
+        # Compatibility field for older clients. It describes whether the
+        # teammate is currently executing, not whether its process is alive.
+        self.is_active = is_executing(state)
+        if self.progress is not None:
+            self.progress.status = state.value
 
     def to_dict(self) -> dict:
         # Exclude progress (runtime-only, contains threading.Lock)
@@ -41,6 +81,7 @@ class TeammateInfo:
             "worktree_path": self.worktree_path,
             "backend_type": self.backend_type,
             "is_active": self.is_active,
+            "lifecycle_state": self.lifecycle_state,
         }
 
     @classmethod
@@ -84,15 +125,18 @@ class AgentTeam:
         member = self.get_member(name)
         if member is None:
             return False
-        member.is_active = is_active
+        if is_active is True:
+            member.transition_to(TeammateState.RUNNING)
+        elif is_active is False:
+            member.transition_to(TeammateState.IDLE)
         return True
 
     def all_idle(self) -> bool:
-        return all(m.is_active is False for m in self.members)
+        return all(m.state == TeammateState.IDLE for m in self.members)
 
 
     def active_members(self) -> list[TeammateInfo]:
-        return [m for m in self.members if m.is_active is not False]
+        return [m for m in self.members if is_executing(m.state)]
 
     def to_dict(self) -> dict:
         return {

@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
+from braincode.teams.lifecycle import TeammateState
 from braincode.teams.mailbox import Mailbox, MailboxMessage, create_message
 from braincode.teams.progress import TeammateProgress, random_verb
 
@@ -18,75 +19,77 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Idle 轮询间隔（秒），对齐 Go 的 IdlePollInterval = 500ms
 IDLE_POLL_INTERVAL = 0.5
-
-# shutdown 消息前缀，对齐 Go 的 ShutdownPrefix
 SHUTDOWN_PREFIX = "[shutdown]"
-
-# lead 名称，对齐 Go 的 LeadName
 LEAD_NAME = "lead"
 
 
 def _is_shutdown_request(msg: MailboxMessage) -> bool:
-    """判断邮箱消息是否为关闭请求。"""
-    return msg.content.strip().startswith(SHUTDOWN_PREFIX)
+    return (
+        msg.message_type == "shutdown_request"
+        or msg.content.strip().startswith(SHUTDOWN_PREFIX)
+    )
 
 
-def _create_idle_notification(member_name: str, reason: str) -> MailboxMessage:
-    """构造 idle 通知消息，发给 lead 表明 teammate 当前轮次已完成。"""
+def _create_idle_notification(
+    member_name: str,
+    lead_agent_id: str,
+    reason: str,
+) -> MailboxMessage:
     return create_message(
         from_agent=member_name,
-        to_agent=LEAD_NAME,
+        to_agent=lead_agent_id,
         content=f"[idle] {member_name} (reason: {reason})",
         summary="idle",
     )
 
 
-def _inject_pending_messages(mailbox: Mailbox, member_name: str) -> str:
-    """读取 teammate 邮箱中的未读消息，拼成 system-reminder 字符串。"""
-    msgs = mailbox.consume(member_name)
+def _drain_pending_messages(
+    mailbox: Mailbox,
+    mailbox_key: str,
+) -> tuple[str, bool]:
+    msgs = mailbox.consume(mailbox_key)
     if not msgs:
-        return ""
+        return "", False
     parts = ["You have new messages:\n"]
-    for m in msgs:
-        parts.append(f"From {m.from_agent}: {m.content}\n")
-    return "\n".join(parts)
+    shutdown_requested = False
+    for msg in msgs:
+        if _is_shutdown_request(msg):
+            shutdown_requested = True
+        else:
+            parts.append(f"From {msg.from_agent}: {msg.content}\n")
+    reminder = "\n".join(parts) if len(parts) > 1 else ""
+    return reminder, shutdown_requested
 
 
 async def _wait_for_next_prompt_or_shutdown(
     mailbox: Mailbox,
-    member_name: str,
+    mailbox_key: str,
 ) -> tuple[str, bool]:
-    """阻塞轮询邮箱，等到有新消息后返回 (prompt, is_shutdown)。
+    """Wait until a follow-up message or shutdown request is available."""
 
-    对齐 Go 的 waitForNextPromptOrShutdown：循环 sleep + 检查邮箱。
-    收到 shutdown 消息返回 ("", True)；否则把普通消息拼成下一轮的 prompt。
-    """
     while True:
         await asyncio.sleep(IDLE_POLL_INTERVAL)
-
-        msgs = mailbox.consume(member_name)
+        msgs = mailbox.consume(mailbox_key)
         if not msgs:
             continue
 
         has_shutdown = False
-        keep: list[MailboxMessage] = []
-        for m in msgs:
-            if _is_shutdown_request(m):
+        follow_ups: list[MailboxMessage] = []
+        for msg in msgs:
+            if _is_shutdown_request(msg):
                 has_shutdown = True
             else:
-                keep.append(m)
+                follow_ups.append(msg)
 
         if has_shutdown:
             return "", True
-
-        # 把剩余消息拼成下一轮的 user prompt
-        if not keep:
+        if not follow_ups:
             continue
+
         parts = ["You have new messages from your team:\n"]
-        for m in keep:
-            parts.append(f"From {m.from_agent}: {m.content}\n")
+        for msg in follow_ups:
+            parts.append(f"From {msg.from_agent}: {msg.content}\n")
         return "\n".join(parts), False
 
 
@@ -103,7 +106,6 @@ class InProcessTeammateHandle:
         self.name = name
         self.progress = progress
 
-
     @property
     def done(self) -> bool:
         return self.task.done()
@@ -116,7 +118,6 @@ class InProcessTeammateHandle:
             except (asyncio.CancelledError, Exception):
                 return None
         return None
-
 
     def cancel(self) -> None:
         if not self.task.done():
@@ -131,9 +132,17 @@ def spawn_inprocess_teammate(
     member: TeammateInfo | None = None,
     team_name: str = "",
     mailbox: Mailbox | None = None,
+    mailbox_key: str = "",
+    lead_agent_id: str = "",
+    on_state_change: Callable[[TeammateState, str], None] | None = None,
 ) -> InProcessTeammateHandle:
+    """Start an in-process teammate governed by the lifecycle state machine.
 
-    # Create progress tracker and attach to member if provided
+    With a mailbox the teammate remains alive after each turn and alternates
+    between RUNNING and IDLE until shutdown. Without a mailbox it performs one
+    turn and moves through STOPPING to STOPPED for backward compatibility.
+    """
+
     progress = TeammateProgress(
         name=name,
         team_name=team_name,
@@ -141,14 +150,40 @@ def spawn_inprocess_teammate(
     )
     if member is not None:
         member.progress = progress
+        progress.status = member.state.value
 
-    def _on_event(event: dict[str, Any]) -> None:
-        """Event callback wired into agent.run_to_completion."""
+    resolved_mailbox_key = mailbox_key or (
+        member.agent_id if member is not None else name
+    )
+    resolved_lead_id = lead_agent_id or LEAD_NAME
+
+    def transition(state: TeammateState, reason: str) -> None:
+        progress.status = state.value
+        if on_state_change is not None:
+            on_state_change(state, reason)
+        elif member is not None:
+            member.transition_to(state)
+
+    def notify_lead(content: str, summary: str) -> None:
+        if mailbox is None:
+            return
+        mailbox.write(
+            resolved_lead_id,
+            create_message(
+                from_agent=name,
+                to_agent=resolved_lead_id,
+                content=content,
+                summary=summary,
+                message_type="text",
+            ),
+        )
+
+    def on_event(event: dict[str, Any]) -> None:
         event_type = event.get("type")
         if event_type == "tool_use":
-            tool_name = event.get("toolName", "")
-            args = event.get("args", {})
-            progress.record_tool_use(tool_name, args)
+            progress.record_tool_use(
+                event.get("toolName", ""), event.get("args", {})
+            )
         elif event_type == "usage":
             usage = event.get("usage", {})
             progress.record_tokens(
@@ -161,75 +196,93 @@ def spawn_inprocess_teammate(
                 with progress._lock:
                     progress.last_message = text
 
-    async def _run() -> str:
-        """teammate 主循环，对齐 Go 的 RunInProcessTeammate。
-
-        有 mailbox 时进入长驻循环：执行 agent → 发 idle 通知 → 轮询等待新任务。
-        没有 mailbox 时退化为单次执行（向后兼容）。
-        """
+    async def run() -> str:
         try:
             if conversation is not None:
                 conv = conversation
             else:
-                from braincode.conversation import ConversationManager as CM
-                conv = CM()
+                from braincode.conversation import ConversationManager
+
+                conv = ConversationManager()
 
             next_prompt = prompt
-            idle_reason = "available"
+            result = ""
+            turn_number = 0
 
             while True:
-                # 注入本轮开始前邮箱里堆积的消息
                 if mailbox is not None:
-                    reminder = _inject_pending_messages(mailbox, name)
+                    reminder, shutdown_requested = _drain_pending_messages(
+                        mailbox, resolved_mailbox_key
+                    )
+                    if shutdown_requested:
+                        transition(
+                            TeammateState.STOPPING,
+                            "shutdown requested before task start",
+                        )
+                        transition(
+                            TeammateState.STOPPED,
+                            "shutdown completed",
+                        )
+                        return result
                     if reminder:
                         conv.add_system_reminder(reminder)
 
-                # 执行一个完整的 agent turn
-                if next_prompt:
-                    result = await agent.run_to_completion(
-                        next_prompt, conv, event_callback=_on_event,
-                    )
-                else:
-                    result = await agent.run_to_completion(
-                        "", conv, event_callback=_on_event,
-                    )
+                turn_number += 1
+                transition(
+                    TeammateState.RUNNING,
+                    "initial task started"
+                    if turn_number == 1
+                    else "follow-up task started",
+                )
+                result = await agent.run_to_completion(
+                    next_prompt, conv, event_callback=on_event
+                )
                 next_prompt = ""
 
-                # 没有 mailbox 时退化为单次执行（向后兼容旧调用方式）
                 if mailbox is None:
-                    progress.status = "completed"
+                    transition(TeammateState.STOPPING, "one-shot task completed")
+                    transition(TeammateState.STOPPED, "one-shot teammate stopped")
                     return result
 
-                # 更新进度状态
-                if idle_reason == "failed":
-                    progress.status = "failed"
-                else:
-                    progress.status = "idle"
-
-                # 通知 lead 本轮已完成
-                mailbox.write(
-                    LEAD_NAME,
-                    _create_idle_notification(name, idle_reason),
+                transition(
+                    TeammateState.IDLE,
+                    "task completed; awaiting work",
                 )
-                idle_reason = "available"
+                mailbox.write(
+                    resolved_lead_id,
+                    _create_idle_notification(
+                        name, resolved_lead_id, "available"
+                    ),
+                )
 
-                # 轮询等待 lead 下发新任务或 shutdown 指令
-                new_prompt, shutdown = await _wait_for_next_prompt_or_shutdown(
-                    mailbox, name,
+                next_prompt, shutdown = await _wait_for_next_prompt_or_shutdown(
+                    mailbox, resolved_mailbox_key
                 )
                 if shutdown:
-                    progress.status = "completed"
+                    transition(TeammateState.STOPPING, "shutdown requested")
+                    transition(TeammateState.STOPPED, "shutdown completed")
                     return result
 
-                next_prompt = new_prompt
-
         except asyncio.CancelledError:
-            progress.status = "stopped"
+            transition(
+                TeammateState.STOPPING,
+                "runtime cancellation requested",
+            )
+            transition(
+                TeammateState.STOPPED,
+                "runtime cancellation completed",
+            )
             raise
-        except Exception:
-            progress.status = "failed"
+        except Exception as exc:
+            transition(TeammateState.FAILED, str(exc))
+            notify_lead(f"[failed] {name}: {exc}", f"{name} failed")
             raise
 
-    task = asyncio.create_task(_run(), name=f"teammate-{name}")
+    task = asyncio.create_task(run(), name=f"teammate-{name}")
     log.info("Spawned in-process teammate %s (verb=%s)", name, progress.spinner_verb)
-    return InProcessTeammateHandle(agent=agent, task=task, name=name, progress=progress)
+    return InProcessTeammateHandle(
+        agent=agent,
+        task=task,
+        name=name,
+        progress=progress,
+    )

@@ -5,6 +5,7 @@
 
 
 from braincode.teams.mailbox import Mailbox, MailboxMessage, create_message
+from braincode.teams.lifecycle import LifecycleTransitionError, TeammateState
 from braincode.teams.models import (
     AgentTeam,
     BackendType,
@@ -21,15 +22,16 @@ __all__ = [
     "AgentTeam",
     "AgentNameRegistry",
     "BackendType",
+    "LifecycleTransitionError",
     "Mailbox",
     "MailboxMessage",
     "SharedTask",
     "SharedTaskStore",
     "TeammateInfo",
     "TeammateProgress",
+    "TeammateState",
     "ToolActivity",
     "create_message",
     "resolve_team_dir",
     "unique_team_name",
 ]
-

@@ -48,12 +48,16 @@ class TeammateTree(Widget):
             lines.append(f"@{p.name}", style="cyan")
             lines.append(": ")
 
-            if p.status == "completed":
-                lines.append("completed", style="green")
+            if p.status == "created":
+                lines.append("created", style="cyan")
             elif p.status == "failed":
                 lines.append("failed", style="red")
             elif p.status == "idle":
                 lines.append("idle", style="dim")
+            elif p.status == "stopping":
+                lines.append("stopping", style="yellow")
+            elif p.status == "stopped":
+                lines.append("stopped", style="green")
             else:
                 lines.append(f"{p.activity_summary}…", style="dim")
 
