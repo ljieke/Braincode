@@ -46,6 +46,7 @@ from braincode.commands.handlers import register_all_commands
 from braincode.commands.parser import parse_command
 from braincode.config import (
     MCPServerConfig,
+    PluginConfig,
     ProviderConfig,
     RecoveryConfig,
     SandboxAppConfig,
@@ -65,6 +66,7 @@ from braincode.permissions import (
 )
 from braincode.skills.loader import SkillLoader
 from braincode.tools import ToolRegistry, create_default_registry
+from braincode.tools.plugins import load_plugins
 from braincode.tools.impl.tool_search import ToolSearchTool
 from braincode.tools.load_skill import LoadSkill
 from braincode.web_content import INDEX_HTML
@@ -85,6 +87,7 @@ class RemoteServer:
         recovery_config: RecoveryConfig | None = None,
         scheduler_config: SchedulerConfig | None = None,
         sandbox_config: SandboxAppConfig | None = None,
+        plugin_config: PluginConfig | None = None,
     ) -> None:
         self.providers = providers
         self._mcp_server_configs = mcp_servers or []
@@ -94,6 +97,7 @@ class RemoteServer:
         self._recovery_config = recovery_config or RecoveryConfig()
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._sandbox_config = sandbox_config or SandboxAppConfig()
+        self._plugin_config = plugin_config or PluginConfig()
 
         # WebSocket 连接池（支持多客户端广播）
         self._connections: set[ServerConnection] = set()
@@ -278,7 +282,7 @@ class RemoteServer:
 
         # 工具注册表
         self.registry = create_default_registry()
-        self.registry.register(ToolSearchTool(self.registry, protocol=provider.protocol))
+        self.registry.register(ToolSearchTool(self.registry))
         bash_tool = self.registry.get("Bash")
         if bash_tool is not None:
             bash_tool.work_dir = work_dir
@@ -295,6 +299,18 @@ class RemoteServer:
                     ],
                     network_enabled=self._sandbox_config.network_enabled,
                 )
+
+        plugin_report = load_plugins(
+            self.registry,
+            work_dir=work_dir,
+            plugin_config=self._plugin_config,
+            permission_checker=checker,
+            services={"remote": self},
+        )
+        if self._plugin_config.strict and plugin_report.errors:
+            raise RuntimeError(
+                "Tool plugin loading failed: " + "; ".join(plugin_report.errors)
+            )
 
         # Skill 加载
         self.skill_loader = SkillLoader(work_dir)
@@ -349,7 +365,7 @@ class RemoteServer:
             scheduled_registry = ToolRegistry()
             for scheduled_tool in self.registry.list_tools():
                 if scheduled_tool.name != "AskUserQuestion":
-                    scheduled_registry.register(scheduled_tool)
+                    scheduled_registry.register_from(self.registry, scheduled_tool)
             scheduled_agent = Agent(
                 client=scheduled_client,
                 registry=scheduled_registry,

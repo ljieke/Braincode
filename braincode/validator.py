@@ -332,13 +332,42 @@ def validate_scheduler(raw_scheduler: dict | None) -> dict:
     return result
 
 
+def validate_plugins(raw_plugins: dict | None) -> dict:
+    defaults = {
+        "enabled": True,
+        "entry_points": True,
+        "paths": [".braincode/plugins"],
+        "allow": [],
+        "deny": [],
+        "strict": False,
+    }
+    if raw_plugins is None:
+        return defaults
+    if not isinstance(raw_plugins, dict):
+        raise ConfigError("'plugins' must be a mapping")
+    result = dict(defaults)
+    for key in ("enabled", "entry_points", "strict"):
+        value = raw_plugins.get(key, defaults[key])
+        if not isinstance(value, bool):
+            raise ConfigError(f"'plugins.{key}' must be a boolean")
+        result[key] = value
+    for key in ("paths", "allow", "deny"):
+        value = raw_plugins.get(key, defaults[key])
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            raise ConfigError(f"'plugins.{key}' must be a list of non-empty strings")
+        result[key] = list(dict.fromkeys(value))
+    return result
+
+
 def validate_config_structure(raw: object) -> dict:
     """校验的主入口。校验解析后的原始配置，返回清洗后的字典。
 
     返回的字典包含以下键：
         providers、permission_mode、mcp_servers、hooks、
         enable_fork、enable_verification_agent、worktree、
-        teammate_mode、enable_coordinator_mode、sandbox
+        teammate_mode、enable_coordinator_mode、sandbox、plugins
     """
     if not isinstance(raw, dict) or "providers" not in raw:
         raise ConfigError("Config must contain a 'providers' list")
@@ -346,6 +375,7 @@ def validate_config_structure(raw: object) -> dict:
     providers = validate_providers(raw["providers"])
     recovery = validate_recovery(raw.get("recovery"))
     scheduler = validate_scheduler(raw.get("scheduler"))
+    plugins = validate_plugins(raw.get("plugins"))
     provider_names = {provider["name"] for provider in providers}
     unknown_fallbacks = [
         name for name in recovery["fallback_providers"] if name not in provider_names
@@ -373,4 +403,5 @@ def validate_config_structure(raw: object) -> dict:
         "sandbox": validate_sandbox(raw.get("sandbox")),
         "recovery": recovery,
         "scheduler": scheduler,
+        "plugins": plugins,
     }

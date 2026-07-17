@@ -23,6 +23,7 @@ from braincode.tools.base import (
     ToolCallComplete,
     ToolCallDelta,
     ToolCallStart,
+    ToolDefinition,
 )
 
 log = logging.getLogger(__name__)
@@ -109,7 +110,7 @@ class RecoveryController:
         conversation: Any,
         *,
         system: str = "",
-        tools: list[dict[str, Any]] | None = None,
+        tools: list[ToolDefinition] | None = None,
         state: Any = None,
         context_recover: Callable[[], Awaitable[bool]] | None = None,
     ) -> AsyncIterator[StreamEvent | RecoveryNotice]:
@@ -246,7 +247,7 @@ async def stream_with_recovery(
     conversation: Any,
     *,
     system: str = "",
-    tools: list[dict[str, Any]] | None = None,
+    tools: list[ToolDefinition] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     controller = RecoveryController([client])
     async for event in controller.stream(

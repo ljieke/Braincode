@@ -155,6 +155,16 @@ class SchedulerConfig:
 
 
 @dataclass
+class PluginConfig:
+    enabled: bool = True
+    entry_points: bool = True
+    paths: list[str] = field(default_factory=lambda: [".braincode/plugins"])
+    allow: list[str] = field(default_factory=list)
+    deny: list[str] = field(default_factory=list)
+    strict: bool = False
+
+
+@dataclass
 class AppConfig:
     providers: list[ProviderConfig]
     permission_mode: str = "default"
@@ -168,6 +178,7 @@ class AppConfig:
     sandbox: SandboxAppConfig = field(default_factory=SandboxAppConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    plugins: PluginConfig = field(default_factory=PluginConfig)
 
 
 def _load_single_file(path: Path) -> AppConfig:
@@ -234,6 +245,15 @@ def _load_single_file(path: Path) -> AppConfig:
         default_misfire_policy=scheduler["default_misfire_policy"],
         default_overlap_policy=scheduler["default_overlap_policy"],
     )
+    plugins = validated["plugins"]
+    plugin_cfg = PluginConfig(
+        enabled=plugins["enabled"],
+        entry_points=plugins["entry_points"],
+        paths=list(plugins["paths"]),
+        allow=list(plugins["allow"]),
+        deny=list(plugins["deny"]),
+        strict=plugins["strict"],
+    )
 
     return AppConfig(
         providers=providers,
@@ -248,6 +268,7 @@ def _load_single_file(path: Path) -> AppConfig:
         sandbox=sandbox_cfg,
         recovery=recovery_cfg,
         scheduler=scheduler_cfg,
+        plugins=plugin_cfg,
     )
 
 
@@ -286,6 +307,8 @@ def _merge_config(base: AppConfig, override: AppConfig) -> AppConfig:
         base.recovery = override.recovery
     if override.scheduler != SchedulerConfig():
         base.scheduler = override.scheduler
+    if override.plugins != PluginConfig():
+        base.plugins = override.plugins
     return base
 
 

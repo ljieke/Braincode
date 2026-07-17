@@ -66,3 +66,27 @@ User Interfaces
    ├── Task Orchestration
    └── Multi-Agent Collaboration
 
+## Tool Plugins
+
+Braincode supports trusted Python tool plugins. Put a plugin module in
+`.braincode/plugins/`, or install a package exposing the `braincode.tools`
+entry-point group. A plugin must provide a manifest and a `create_tools(context)`
+factory; see [docs/tool_plugin_example.py](docs/tool_plugin_example.py).
+
+Example configuration:
+
+```yaml
+plugins:
+  enabled: true
+  entry_points: true
+  paths: [".braincode/plugins"]
+  allow: []
+  deny: []
+  strict: false
+```
+
+Plugins are trusted in-process Python code. They use the same `Tool` contract,
+permission checks, deferred discovery, and provider-neutral tool schema as
+built-in tools. Set `allow` to an explicit list when only selected plugins
+should load; set `strict: true` to fail startup on a plugin error.
+

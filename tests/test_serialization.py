@@ -19,10 +19,55 @@ from braincode.conversation import (
 )
 from braincode.serialization import (
     build_anthropic_messages,
+    build_anthropic_tools,
+    build_chat_completion_tools,
     build_chat_completion_messages,
     build_messages,
     build_openai_input,
+    build_openai_tools,
 )
+from braincode.tools.base import ToolDefinition
+
+
+TOOL_DEFINITIONS: list[ToolDefinition] = [
+    {
+        "name": "ReadFile",
+        "description": "Read a file",
+        "input_schema": {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+        },
+    }
+]
+
+
+def test_tool_definitions_serialize_at_provider_boundary():
+    anthropic = build_anthropic_tools(TOOL_DEFINITIONS)
+    openai = build_openai_tools(TOOL_DEFINITIONS)
+    chat = build_chat_completion_tools(TOOL_DEFINITIONS)
+
+    assert anthropic == [{
+        "name": "ReadFile",
+        "description": "Read a file",
+        "input_schema": TOOL_DEFINITIONS[0]["input_schema"],
+    }]
+    assert openai == [{
+        "type": "function",
+        "name": "ReadFile",
+        "description": "Read a file",
+        "parameters": TOOL_DEFINITIONS[0]["input_schema"],
+    }]
+    assert chat == [{
+        "type": "function",
+        "function": {
+            "name": "ReadFile",
+            "description": "Read a file",
+            "parameters": TOOL_DEFINITIONS[0]["input_schema"],
+        },
+    }]
+    assert "type" not in TOOL_DEFINITIONS[0]
+    assert "parameters" not in TOOL_DEFINITIONS[0]
 
 
 def test_anthropic_preserves_signed_thinking_at_head():

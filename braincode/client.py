@@ -15,8 +15,11 @@ from braincode.config import ProviderConfig
 from braincode.conversation import ConversationManager
 from braincode.serialization import (
     build_anthropic_messages,
+    build_anthropic_tools,
+    build_chat_completion_tools,
     build_chat_completion_messages,
     build_openai_input,
+    build_openai_tools,
 )
 from braincode.tools.base import (
     StreamEnd,
@@ -27,6 +30,7 @@ from braincode.tools.base import (
     ToolCallComplete,
     ToolCallDelta,
     ToolCallStart,
+    ToolDefinition,
 )
 
 
@@ -229,7 +233,7 @@ class LLMClient(ABC):
         self,
         conversation: ConversationManager,
         system: str = "",
-        tools: list[dict[str, Any]] | None = None,
+        tools: list[ToolDefinition] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         yield TextDelta("")
 
@@ -288,7 +292,7 @@ class AnthropicClient(LLMClient):
         self,
         conversation: ConversationManager,
         system: str = "",
-        tools: list[dict[str, Any]] | None = None,
+        tools: list[ToolDefinition] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         import anthropic as _anthropic
 
@@ -312,7 +316,9 @@ class AnthropicClient(LLMClient):
                 "cache_control": {"type": "ephemeral"},
             }]
         if tools:
-            kwargs["tools"] = _mark_last_tool_for_cache(tools)
+            kwargs["tools"] = _mark_last_tool_for_cache(
+                build_anthropic_tools(tools)
+            )
 
         if self.thinking:
             if _supports_adaptive_thinking(self.model):
@@ -474,7 +480,7 @@ class OpenAIClient(LLMClient):
         self,
         conversation: ConversationManager,
         system: str = "",
-        tools: list[dict[str, Any]] | None = None,
+        tools: list[ToolDefinition] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         import openai as _openai
 
@@ -488,7 +494,7 @@ class OpenAIClient(LLMClient):
         if system:
             kwargs["instructions"] = system
         if tools:
-            kwargs["tools"] = tools
+            kwargs["tools"] = build_openai_tools(tools)
 
         current_tool_name = ""
         current_call_id = ""
@@ -614,38 +620,11 @@ class OpenAICompatClient(LLMClient):
     def set_max_output_tokens(self, tokens: int) -> None:
         self.max_output_tokens = tokens
 
-    @staticmethod
-    def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """把 tool schema 转换成 Chat Completions 格式。
-
-        tool 注册表为 ``openai`` 系列输出的是 Responses API 风格的 dict::
-
-            {"type": "function", "name": "...", "description": "...",
-             "parameters": {...}}
-
-        而 Chat Completions 要求把 name/description/parameters 嵌套在
-        ``function`` 键下::
-
-            {"type": "function", "function": {"name": "...",
-             "description": "...", "parameters": {...}}}
-        """
-        converted: list[dict[str, Any]] = []
-        for t in tools:
-            converted.append({
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": t.get("parameters", t.get("input_schema", {})),
-                },
-            })
-        return converted
-
     async def stream(
         self,
         conversation: ConversationManager,
         system: str = "",
-        tools: list[dict[str, Any]] | None = None,
+        tools: list[ToolDefinition] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         import openai as _openai
 
@@ -663,7 +642,7 @@ class OpenAICompatClient(LLMClient):
             "stream_options": {"include_usage": True},
         }
         if tools:
-            kwargs["tools"] = self._convert_tools(tools)
+            kwargs["tools"] = build_chat_completion_tools(tools)
 
         # 用于累积 streaming tool call 的状态。Chat Completions 流按
         # tool_calls 列表中的位置索引下发 delta，我们按索引跟踪每个进行中的调用。

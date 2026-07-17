@@ -17,8 +17,18 @@ from braincode.client import (
 from braincode.context import RecoveryState
 from braincode.conversation import ConversationManager
 from braincode.recovery import RecoveryController, RecoveryNotice, RetryPolicy
+from braincode.serialization import (
+    build_anthropic_tools,
+    build_chat_completion_tools,
+)
 from braincode.tools import create_default_registry
-from braincode.tools.base import StreamEnd, StreamEvent, TextDelta, ToolCallComplete
+from braincode.tools.base import (
+    StreamEnd,
+    StreamEvent,
+    TextDelta,
+    ToolCallComplete,
+    ToolDefinition,
+)
 from braincode.validator import ConfigError, validate_config_structure
 
 
@@ -42,6 +52,25 @@ class ScriptedClient(LLMClient):
         for event in action:
             if isinstance(event, Exception):
                 raise event
+            yield event
+
+
+class AdaptingScriptedClient(ScriptedClient):
+    def __init__(self, name: str, actions: list[object], adapter) -> None:
+        super().__init__(name, actions)
+        self.adapter = adapter
+        self.received_tools: list[list[ToolDefinition]] = []
+        self.wire_tools: list[list[dict]] = []
+
+    async def stream(
+        self, conversation, system="", tools=None
+    ) -> AsyncIterator[StreamEvent]:
+        definitions = tools or []
+        self.received_tools.append(definitions)
+        self.wire_tools.append(self.adapter(definitions))
+        async for event in super().stream(
+            conversation, system=system, tools=tools
+        ):
             yield event
 
 
@@ -100,6 +129,39 @@ async def test_overload_switches_to_configured_fallback() -> None:
     assert controller.current_client is fallback
     assert primary.calls == 1
     assert fallback.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_protocol_fallback_reserializes_canonical_tools() -> None:
+    definitions: list[ToolDefinition] = [{
+        "name": "ReadFile",
+        "description": "Read a file",
+        "input_schema": {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+        },
+    }]
+    primary = AdaptingScriptedClient(
+        "anthropic", [OverloadedError("overloaded")], build_anthropic_tools
+    )
+    fallback = AdaptingScriptedClient(
+        "openai-compat", [success("fallback result")],
+        build_chat_completion_tools,
+    )
+    controller = RecoveryController([primary, fallback])
+
+    _ = [
+        event
+        async for event in controller.stream(
+            ConversationManager(), tools=definitions
+        )
+    ]
+
+    assert primary.received_tools == [definitions]
+    assert fallback.received_tools == [definitions]
+    assert primary.wire_tools[0][0]["input_schema"] == definitions[0]["input_schema"]
+    assert fallback.wire_tools[0][0]["function"]["parameters"] == definitions[0]["input_schema"]
+    assert "function" not in definitions[0]
 
 
 @pytest.mark.asyncio

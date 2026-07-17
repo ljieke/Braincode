@@ -18,6 +18,7 @@ from braincode.agents.trace import TraceManager
 from braincode.client import LLMClient, create_client
 from braincode.config import (
     MCPServerConfig,
+    PluginConfig,
     ProviderConfig,
     RecoveryConfig,
     SandboxAppConfig,
@@ -55,6 +56,7 @@ from braincode.recovery import RecoveryController, build_recovery_controller
 from braincode.skills.loader import SkillLoader
 from braincode.teams.manager import TeamManager
 from braincode.tools import ToolRegistry, create_default_registry
+from braincode.tools.plugins import load_plugins
 from braincode.tools.agent_tool import AgentTool
 from braincode.tools.ask_user import AskUserTool
 from braincode.tools.exit_plan_mode import ExitPlanModeTool
@@ -367,6 +369,7 @@ def build_runtime(
     sandbox_config: SandboxAppConfig | None = None,
     recovery_config: RecoveryConfig | None = None,
     scheduler_config: SchedulerConfig | None = None,
+    plugin_config: PluginConfig | None = None,
     mcp_servers: list[MCPServerConfig] | None = None,
     enable_fork: bool = False,
     enable_verification_agent: bool = False,
@@ -384,6 +387,7 @@ def build_runtime(
     sandbox_config = sandbox_config or SandboxAppConfig()
     recovery_config = recovery_config or RecoveryConfig()
     scheduler_config = scheduler_config or SchedulerConfig()
+    plugin_config = plugin_config or PluginConfig()
     event_bus = RuntimeEventBus()
     client = client or create_client(provider)
     registry = registry or create_default_registry(file_cache=file_cache)
@@ -400,6 +404,15 @@ def build_runtime(
         mode=permission_mode,
         sandbox_enabled=(sandbox_config.enabled and sandbox_config.auto_allow),
     )
+    plugin_report = load_plugins(
+        registry,
+        work_dir=work_dir,
+        plugin_config=plugin_config,
+        permission_checker=checker,
+        services={"runtime": None},
+    )
+    if plugin_config.strict and plugin_report.errors:
+        raise RuntimeError("Tool plugin loading failed: " + "; ".join(plugin_report.errors))
     if sandbox_config.enabled:
         from braincode.sandbox import SandboxConfig, create_sandbox
 
@@ -447,7 +460,7 @@ def build_runtime(
     install_skill_tool = InstallSkillTool()
     install_skill_tool.set_loader(skill_loader)
     registry.register(install_skill_tool)
-    registry.register(ToolSearchTool(registry, protocol=provider.protocol))
+    registry.register(ToolSearchTool(registry))
     if support_user_questions:
         registry.register(AskUserTool())
 
@@ -488,7 +501,7 @@ def build_runtime(
         scheduled_registry = ToolRegistry()
         for tool in registry.list_tools():
             if tool.name != "AskUserQuestion":
-                scheduled_registry.register(tool)
+                scheduled_registry.register_from(registry, tool)
         scheduled_agent = Agent(
             client=scheduled_client,
             registry=scheduled_registry,

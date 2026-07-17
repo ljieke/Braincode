@@ -89,6 +89,7 @@ def main() -> None:
             recovery_config=config.recovery,
             scheduler_config=config.scheduler,
             sandbox_config=config.sandbox,
+            plugin_config=config.plugins,
         )
         asyncio.run(server.run())
         return
@@ -110,6 +111,7 @@ def main() -> None:
         sandbox_config=config.sandbox,
         recovery_config=config.recovery,
         scheduler_config=config.scheduler,
+        plugin_config=config.plugins,
     )
     app.run()
 
@@ -141,6 +143,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         RuleEngine,
     )
     from braincode.tools import create_default_registry
+    from braincode.tools.plugins import load_plugins
     from braincode.agents.loader import AgentLoader
     from braincode.agents.task_manager import TaskManager
     from braincode.agents.trace import TraceManager
@@ -202,7 +205,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     instructions = load_instructions(work_dir)
     memory_manager = MemoryManager(work_dir)
     registry = create_default_registry()
-    registry.register(ToolSearchTool(registry, protocol=provider.protocol))
+    registry.register(ToolSearchTool(registry))
     bash_tool = registry.get("Bash")
     if bash_tool is not None:
         bash_tool.work_dir = work_dir
@@ -219,6 +222,19 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
                 ],
                 network_enabled=config.sandbox.network_enabled,
             )
+
+    plugin_report = load_plugins(
+        registry,
+        work_dir=work_dir,
+        config=config,
+        plugin_config=config.plugins,
+        permission_checker=checker,
+        services={"mode": "prompt"},
+    )
+    if config.plugins.strict and plugin_report.errors:
+        raise RuntimeError(
+            "Tool plugin loading failed: " + "; ".join(plugin_report.errors)
+        )
 
     agent = Agent(
         client=client,
@@ -253,7 +269,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         scheduled_registry = type(registry)()
         for scheduled_tool in registry.list_tools():
             if scheduled_tool.name != "AskUserQuestion":
-                scheduled_registry.register(scheduled_tool)
+                scheduled_registry.register_from(registry, scheduled_tool)
         scheduled_agent = Agent(
             client=scheduled_client,
             registry=scheduled_registry,

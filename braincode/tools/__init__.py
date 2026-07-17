@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from braincode.tools.base import Tool
+from braincode.tools.base import Tool, ToolDefinition
 
 if TYPE_CHECKING:
     from braincode.cache import FileCache
@@ -15,11 +15,60 @@ if TYPE_CHECKING:
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        self._tool_owners: dict[str, str] = {}
+        self._plugin_tools: dict[str, set[str]] = {}
         self._disabled: set[str] = set()
         self._discovered: set[str] = set()
 
-    def register(self, tool: Tool) -> None:
+    def register(self, tool: Tool, *, owner: str = "builtin") -> None:
+        if not isinstance(tool, Tool):
+            raise TypeError("tool must be an instance of Tool")
+        existing_owner = self._tool_owners.get(tool.name)
+        if existing_owner is not None and existing_owner != owner:
+            raise ValueError(
+                f"Tool '{tool.name}' is already registered by {existing_owner}"
+            )
         self._tools[tool.name] = tool
+        self._tool_owners[tool.name] = owner
+        if owner != "builtin":
+            self._plugin_tools.setdefault(owner, set()).add(tool.name)
+
+    def register_from(self, source: "ToolRegistry", tool: Tool) -> None:
+        """Copy a tool while preserving its source owner metadata."""
+        self.register(tool, owner=source.get_tool_owner(tool.name) or "builtin")
+
+    def register_plugin(self, plugin_id: str, tools: list[Tool]) -> None:
+        """Atomically register all tools belonging to one plugin."""
+        if not plugin_id.strip():
+            raise ValueError("plugin_id must not be empty")
+        names = [tool.name for tool in tools]
+        if len(names) != len(set(names)):
+            raise ValueError(f"Plugin '{plugin_id}' contains duplicate tool names")
+        for name in names:
+            existing_owner = self._tool_owners.get(name)
+            if existing_owner is not None:
+                raise ValueError(
+                    f"Tool '{name}' is already registered by {existing_owner}"
+                )
+        for tool in tools:
+            self.register(tool, owner=plugin_id)
+
+    def unregister_plugin(self, plugin_id: str) -> None:
+        for name in self._plugin_tools.pop(plugin_id, set()):
+            self._tools.pop(name, None)
+            self._tool_owners.pop(name, None)
+            self._disabled.discard(name)
+            self._discovered.discard(name)
+
+    def get_tool_owner(self, name: str) -> str | None:
+        return self._tool_owners.get(name)
+
+    def get_plugin_tools(self, plugin_id: str) -> list[Tool]:
+        return [
+            self._tools[name]
+            for name in sorted(self._plugin_tools.get(plugin_id, set()))
+            if name in self._tools
+        ]
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
@@ -57,8 +106,11 @@ class ToolRegistry:
         ]
 
     def search_deferred(
-        self, query: str, max_results: int, protocol: str = "anthropic"
-    ) -> list[dict[str, Any]]:
+        self, query: str, max_results: int, protocol: str | None = None
+    ) -> list[ToolDefinition]:
+        # ``protocol`` is retained for callers written against the old API.
+        # Definitions are now always provider-neutral.
+        del protocol
         query_lower = query.lower()
         scored: list[tuple[int, str, Tool]] = []
         for name, tool in self._tools.items():
@@ -81,64 +133,51 @@ class ToolRegistry:
             if score > 0:
                 scored.append((score, name, tool))
         scored.sort(key=lambda x: x[0], reverse=True)
-        results: list[dict[str, Any]] = []
+        results: list[ToolDefinition] = []
         for _, _name, tool in scored[:max_results]:
-            base = tool.get_schema()
-            if protocol in ("openai", "openai-compat"):
-                results.append({
-                    "type": "function",
-                    "name": base["name"],
-                    "description": base["description"],
-                    "parameters": base["input_schema"],
-                })
-            else:
-                results.append(base)
+            results.append(tool.get_schema())
         return results
 
     def find_deferred_by_names(
-        self, names: list[str], protocol: str = "anthropic"
-    ) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
+        self, names: list[str], protocol: str | None = None
+    ) -> list[ToolDefinition]:
+        # Backward-compatible argument; serialization belongs to LLM clients.
+        del protocol
+        results: list[ToolDefinition] = []
         for name in names:
             tool = self._tools.get(name)
             if tool is None:
                 continue
             if not getattr(tool, "should_defer", False):
                 continue
-            base = tool.get_schema()
-            if protocol in ("openai", "openai-compat"):
-                results.append({
-                    "type": "function",
-                    "name": base["name"],
-                    "description": base["description"],
-                    "parameters": base["input_schema"],
-                })
-            else:
-                results.append(base)
+            results.append(tool.get_schema())
         return results
 
     def list_tools(self) -> list[Tool]:
         return list(self._tools.values())
 
 
-    def get_all_schemas(self, protocol: str = "anthropic") -> list[dict[str, Any]]:
-        schemas: list[dict[str, Any]] = []
+    def get_all_definitions(self) -> list[ToolDefinition]:
+        definitions: list[ToolDefinition] = []
         for name, tool in self._tools.items():
             if name in self._disabled:
                 continue
             if getattr(tool, "should_defer", False) and name not in self._discovered:
                 continue
-            base = tool.get_schema()
-            if protocol in ("openai", "openai-compat"):
-                schemas.append({
-                    "type": "function",
-                    "name": base["name"],
-                    "description": base["description"],
-                    "parameters": base["input_schema"],
-                })
-            else:
-                schemas.append(base)
-        return schemas
+            definitions.append(tool.get_schema())
+        return definitions
+
+    def get_all_schemas(
+        self, protocol: str | None = None
+    ) -> list[ToolDefinition]:
+        """Return canonical definitions regardless of the requested protocol.
+
+        ``protocol`` remains accepted so external tools do not break during the
+        migration. Provider-specific wire schemas are built by the active
+        ``LLMClient`` immediately before each request.
+        """
+        del protocol
+        return self.get_all_definitions()
 
 
 def create_default_registry(file_cache: FileCache | None = None, file_history: Any = None) -> ToolRegistry:

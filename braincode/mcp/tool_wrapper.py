@@ -10,7 +10,7 @@ from mcp import types as mcp_types
 from pydantic import BaseModel, create_model
 
 from braincode.mcp.client import MCPClient
-from braincode.tools.base import Tool, ToolResult
+from braincode.tools.base import Tool, ToolDefinition, ToolResult
 
 
 def _build_params_model(
@@ -82,7 +82,7 @@ class MCPToolWrapper(Tool):
         return self._tool_def.name
 
 
-    def get_schema(self) -> dict[str, Any]:
+    def get_schema(self) -> ToolDefinition:
         return {
             "name": self.name,
             "description": self.description,

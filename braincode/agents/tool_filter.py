@@ -133,9 +133,9 @@ def resolve_agent_tools(
 
     filtered = ToolRegistry()
     for tool in mcp_tools.values():
-        filtered.register(tool)
+        filtered.register_from(parent_registry, tool)
     for tool in all_tools.values():
-        filtered.register(tool)
+        filtered.register_from(parent_registry, tool)
     return filtered
 
 
@@ -190,7 +190,7 @@ def build_teammate_tools(
 
     registry = ToolRegistry()
     for tool in filtered.values():
-        registry.register(tool)
+        registry.register_from(parent_registry, tool)
     for tool in coordination_tools:
         registry.register(tool)
 
@@ -213,9 +213,9 @@ def clone_registry_for_fork(parent_registry: ToolRegistry) -> ToolRegistry:
         if tool.name == "Agent" and hasattr(tool, "query_source"):
             clone = copy.copy(tool)
             clone.query_source = FORK_QUERY_SOURCE
-            forked.register(clone)
+            forked.register_from(parent_registry, clone)
         else:
-            forked.register(tool)
+            forked.register_from(parent_registry, tool)
     return forked
 
 
@@ -224,5 +224,5 @@ def apply_coordinator_filter(registry: ToolRegistry) -> ToolRegistry:
     filtered = ToolRegistry()
     for name, tool in all_tools.items():
         if _is_mcp_tool(name) or name in COORDINATOR_MODE_ALLOWED_TOOLS:
-            filtered.register(tool)
+            filtered.register_from(registry, tool)
     return filtered

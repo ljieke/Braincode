@@ -8,9 +8,53 @@ import json
 from typing import Any
 
 from braincode.conversation import Message
+from braincode.tools.base import ToolDefinition
 
 # 把 provider 无关的内部消息序列化成各家 API 的请求格式。
 # 这一层属于「适配器」职责，对话层（ConversationManager）只管消息、不懂线上格式。
+
+
+def build_anthropic_tools(
+    tools: list[ToolDefinition],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": tool["name"],
+            "description": tool["description"],
+            "input_schema": tool["input_schema"],
+        }
+        for tool in tools
+    ]
+
+
+def build_openai_tools(
+    tools: list[ToolDefinition],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "name": tool["name"],
+            "description": tool["description"],
+            "parameters": tool["input_schema"],
+        }
+        for tool in tools
+    ]
+
+
+def build_chat_completion_tools(
+    tools: list[ToolDefinition],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"],
+            },
+        }
+        for tool in tools
+    ]
 
 
 def build_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:

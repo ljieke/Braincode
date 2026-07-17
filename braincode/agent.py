@@ -728,7 +728,7 @@ class Agent:
                     + "\n".join(deferred_names)
                 )
 
-            tools = self.registry.get_all_schemas(self.protocol)
+            tools = self.registry.get_all_definitions()
 
             # Layer 1: apply tool-result budget（就地修改 conversation）
             new_records = apply_tool_result_budget(
@@ -747,7 +747,7 @@ class Agent:
                 protocol=self.protocol,
                 breaker=self.compact_breaker,
                 recovery=self.recovery_state,
-                tool_schemas=self.registry.get_all_schemas(self.protocol),
+                tool_schemas=self.registry.get_all_definitions(),
                 transcript_path=self._transcript_path,
             )
             if isinstance(compact_result, CompactEvent):
@@ -1311,7 +1311,7 @@ class Agent:
             manual=True,
             breaker=self.compact_breaker,
             recovery=self.recovery_state,
-            tool_schemas=self.registry.get_all_schemas(self.protocol),
+            tool_schemas=self.registry.get_all_definitions(),
             transcript_path=self._transcript_path,
         )
         if isinstance(result, CompactEvent):
@@ -1354,7 +1354,7 @@ class Agent:
             await self._run_hook_event("user_prompt_submit", message=user_message)
             await self._run_hook_event("session_start", message=user_message)
 
-        tools = self.registry.get_all_schemas(self.protocol)
+        tools = self.registry.get_all_definitions()
 
         log.info(
             "[run_to_completion] agent=%s tools=%d names=%s coordinator=%s",
@@ -1415,7 +1415,7 @@ class Agent:
                 protocol=self.protocol,
                 breaker=self.compact_breaker,
                 recovery=self.recovery_state,
-                tool_schemas=self.registry.get_all_schemas(self.protocol),
+                tool_schemas=self.registry.get_all_definitions(),
                 transcript_path=self._transcript_path,
             )
             if isinstance(compact_result, CompactEvent):

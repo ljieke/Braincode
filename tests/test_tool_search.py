@@ -100,6 +100,20 @@ def test_deferred_not_in_schemas():
     assert "DeferredAlpha" not in names
     assert "DeferredBeta" not in names
 
+
+def test_registry_definitions_do_not_change_with_protocol():
+    reg = _make_registry()
+
+    anthropic = reg.get_all_schemas("anthropic")
+    openai = reg.get_all_schemas("openai")
+    openai_compat = reg.get_all_schemas("openai-compat")
+
+    assert anthropic == openai == openai_compat
+    assert anthropic[0]["name"] == "NormalTool"
+    assert "input_schema" in anthropic[0]
+    assert "type" not in anthropic[0]
+    assert "parameters" not in anthropic[0]
+
 @pytest.mark.asyncio
 async def test_tool_search_marks_discovered():
     """ToolSearchTool.execute 应将工具标记为已发现。"""

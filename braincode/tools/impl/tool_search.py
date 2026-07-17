@@ -5,11 +5,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any
-
 from pydantic import BaseModel
 
-from braincode.tools.base import Tool, ToolResult
+from braincode.tools.base import Tool, ToolDefinition, ToolResult
 
 if __import__("typing").TYPE_CHECKING:
     from braincode.tools import ToolRegistry
@@ -35,13 +33,15 @@ class ToolSearchTool(Tool):
     def __init__(
         self,
         registry: ToolRegistry,
-        protocol: str = "anthropic",
+        protocol: str | None = None,
     ) -> None:
         self._registry = registry
-        self._protocol = protocol
+        # Kept for compatibility with existing integrations. Search results are
+        # canonical definitions and no longer depend on the active provider.
+        del protocol
 
 
-    def get_schema(self) -> dict[str, Any]:
+    def get_schema(self) -> ToolDefinition:
         schema = self.params_model.model_json_schema()
         schema.pop("title", None)
         return {
@@ -58,11 +58,9 @@ class ToolSearchTool(Tool):
 
         if query.startswith("select:"):
             names = [n.strip() for n in query[7:].split(",")]
-            schemas = self._registry.find_deferred_by_names(names, self._protocol)
+            schemas = self._registry.find_deferred_by_names(names)
         else:
-            schemas = self._registry.search_deferred(
-                query, max_results, self._protocol
-            )
+            schemas = self._registry.search_deferred(query, max_results)
 
         if not schemas:
             deferred_names = self._registry.get_deferred_tool_names()

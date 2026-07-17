@@ -52,6 +52,7 @@ from braincode.commands.completion import CompletionPopup
 from braincode.commands.handlers import register_all_commands
 from braincode.config import (
     MCPServerConfig,
+    PluginConfig,
     ProviderConfig,
     RecoveryConfig,
     SchedulerConfig,
@@ -89,6 +90,7 @@ from rich.text import Text as RichText
 from textual.theme import Theme
 from braincode.cache import FileCache
 from braincode.tools import ToolRegistry, create_default_registry
+from braincode.tools.plugins import load_plugins
 from braincode.tools.agent_tool import AgentTool
 from braincode.tools.ask_user import AskUserEvent, AskUserTool
 from braincode.tools.impl.tool_search import ToolSearchTool
@@ -612,6 +614,7 @@ class BraincodeApp(App):
         sandbox_config: Any = None,
         recovery_config: RecoveryConfig | None = None,
         scheduler_config: SchedulerConfig | None = None,
+        plugin_config: PluginConfig | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
         self.providers = providers
@@ -627,6 +630,7 @@ class BraincodeApp(App):
         self._sandbox_cfg: SandboxAppConfig = sandbox_config or SandboxAppConfig()
         self._recovery_config = recovery_config or RecoveryConfig()
         self._scheduler_config = scheduler_config or SchedulerConfig()
+        self._plugin_config = plugin_config or PluginConfig()
         self.file_cache = FileCache()
         self.client: LLMClient | None = None
         self.conversation = ConversationManager()
@@ -765,6 +769,18 @@ class BraincodeApp(App):
                     bash_tool.sandbox = os_sandbox
                     bash_tool.sandbox_config = sandbox_config
 
+        plugin_report = load_plugins(
+            self.registry,
+            work_dir=work_dir,
+            plugin_config=self._plugin_config,
+            permission_checker=checker,
+            services={"app": self},
+        )
+        if self._plugin_config.strict and plugin_report.errors:
+            raise RuntimeError(
+                "Tool plugin loading failed: " + "; ".join(plugin_report.errors)
+            )
+
         self._instructions_content = load_instructions(work_dir)
         self.memory_manager = MemoryManager(work_dir)
         self.session_manager = SessionManager(work_dir)
@@ -786,7 +802,7 @@ class BraincodeApp(App):
         self._install_skill_tool = install_skill_tool
 
         self.registry.register(
-            ToolSearchTool(self.registry, protocol=provider.protocol)
+            ToolSearchTool(self.registry)
         )
         self.registry.register(AskUserTool())
 
@@ -842,7 +858,7 @@ class BraincodeApp(App):
             scheduled_registry = ToolRegistry()
             for scheduled_tool in self.registry.list_tools():
                 if scheduled_tool.name != "AskUserQuestion":
-                    scheduled_registry.register(scheduled_tool)
+                    scheduled_registry.register_from(self.registry, scheduled_tool)
             scheduled_agent = Agent(
                 client=scheduled_client,
                 registry=scheduled_registry,

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel
 
@@ -15,6 +15,14 @@ SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".tox", ".mypy_cach
 MAX_OUTPUT_CHARS = 10000
 
 ToolCategory = Literal["read", "write", "command"]
+
+
+class ToolDefinition(TypedDict):
+    """Provider-neutral tool definition used inside the runtime."""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
 
 
 @dataclass
@@ -37,7 +45,7 @@ class Tool(ABC):
         return self.category == "read"
 
 
-    def get_schema(self) -> dict[str, Any]:
+    def get_schema(self) -> ToolDefinition:
         schema = self.params_model.model_json_schema()
         schema.pop("title", None)
         return {
