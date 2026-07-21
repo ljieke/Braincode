@@ -53,6 +53,22 @@ def test_runtime_event_bus_delivers_same_event_to_all_surfaces() -> None:
     assert tui[0]["type"] == "provider_switched"
 
 
+def test_runtime_event_bus_accepts_tool_loop_guarded() -> None:
+    bus = RuntimeEventBus()
+
+    bus.emit(
+        "tool_loop_guarded",
+        {
+            "tool_name": "ReadFile",
+            "call_count": 5,
+            "same_result_count": 4,
+            "policy": "guard",
+        },
+    )
+
+    assert bus.history()[0].type == RuntimeEventType.TOOL_LOOP_GUARDED
+
+
 def test_job_manager_publishes_lifecycle_events(tmp_path: Path) -> None:
     bus = RuntimeEventBus()
     manager = JobManager.for_project(tmp_path, event_sink=bus.emit)

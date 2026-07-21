@@ -65,6 +65,7 @@ from braincode.tools.base import (
 )
 from braincode.tools.recent_calls import (
     CallContext,
+    GuardSnapshot,
     RecentToolCallTracker,
     RepeatPolicy,
     TrackedToolResult,
@@ -778,6 +779,7 @@ class Agent:
             elif isinstance(compact_result, str):
                 yield ErrorEvent(message=compact_result)
 
+            tool_guard_snapshot = self.recent_tool_calls.guard_snapshot()
             collector = StreamCollector()
             executor = StreamingExecutor()
             deferred_tool_calls: list[ToolCallComplete] = []
@@ -813,7 +815,11 @@ class Agent:
                         deferred_tool_calls.append(tc)
                     else:
                         self.recovery_state.tool_execution_started = True
-                        executor.submit(self._execute_single_tool_direct(tc))
+                        executor.submit(
+                            self._execute_single_tool_direct(
+                                tc, tool_guard_snapshot
+                            )
+                        )
                 yield event
 
             response = collector.response
@@ -979,7 +985,9 @@ class Agent:
                 elapsed = 0.0
                 is_unknown = False
 
-                async for item in self._execute_tool_tracked(tc):
+                async for item in self._execute_tool_tracked(
+                    tc, tool_guard_snapshot
+                ):
                     if isinstance(item, PermissionRequest):
                         yield item
                     else:
@@ -1080,12 +1088,27 @@ class Agent:
         self,
         tc: ToolCallComplete,
         policy: RepeatPolicy = RepeatPolicy.OBSERVE,
+        guard_snapshot: GuardSnapshot | None = None,
     ) -> CallContext:
         return self.recent_tool_calls.before_call(
             tc.tool_name,
             tc.arguments,
             policy,
+            guard_snapshot,
         )
+
+    @staticmethod
+    def _repeat_policy_for_tool(tool: Any) -> RepeatPolicy:
+        raw_policy = getattr(tool, "repeat_policy", RepeatPolicy.OBSERVE)
+        try:
+            return RepeatPolicy(raw_policy)
+        except (TypeError, ValueError):
+            log.warning(
+                "Invalid repeat policy for tool %s: %r; using observe",
+                getattr(tool, "name", type(tool).__name__),
+                raw_policy,
+            )
+            return RepeatPolicy.OBSERVE
 
     def _finish_tracked_tool_call(
         self,
@@ -1120,7 +1143,7 @@ class Agent:
                 fingerprint=context.fingerprint,
                 call_count=decision.call_count,
                 same_result_count=decision.same_result_count,
-                policy=RepeatPolicy.OBSERVE.value,
+                policy=context.policy.value,
             )
         elif decision.repeated:
             self._emit_runtime_event(
@@ -1130,13 +1153,49 @@ class Agent:
                 fingerprint=context.fingerprint,
                 call_count=decision.call_count,
                 same_result_count=decision.same_result_count,
-                policy=RepeatPolicy.OBSERVE.value,
+                policy=context.policy.value,
             )
         return TrackedToolResult(
             result=result,
             conversation_output=conversation_output,
             repeated=decision.repeated,
             warning=decision.warning,
+        )
+
+    def _guard_tracked_tool_call(
+        self,
+        context: CallContext,
+        tc: ToolCallComplete,
+    ) -> TrackedToolResult:
+        output = (
+            "Tool loop guarded: this exact call already produced the same result "
+            f"{context.same_result_count} times. This call was not executed.\n"
+            "Change strategy, inspect a different signal, or explain the blocker."
+        )
+        log.warning(
+            "Tool loop guarded: agent=%s tool=%s fingerprint=%s "
+            "same_result_count=%d",
+            self.agent_id,
+            tc.tool_name,
+            context.fingerprint,
+            context.same_result_count,
+        )
+        self._emit_runtime_event(
+            "tool_loop_guarded",
+            agent_id=self.agent_id,
+            tool_name=tc.tool_name,
+            fingerprint=context.fingerprint,
+            call_count=context.call_number,
+            same_result_count=context.same_result_count,
+            policy=context.policy.value,
+        )
+        result = ToolResult(output=output, is_error=True)
+        return TrackedToolResult(
+            result=result,
+            conversation_output=output,
+            repeated=True,
+            warning=output,
+            guarded=True,
         )
 
     @staticmethod
@@ -1151,8 +1210,15 @@ class Agent:
         self,
         tool: Any,
         tc: ToolCallComplete,
+        guard_snapshot: GuardSnapshot | None = None,
     ) -> TrackedToolResult:
-        context = self._begin_tracked_tool_call(tc)
+        context = self._begin_tracked_tool_call(
+            tc,
+            self._repeat_policy_for_tool(tool),
+            guard_snapshot,
+        )
+        if context.blocked:
+            return self._guard_tracked_tool_call(context, tc)
         try:
             try:
                 params = tool.params_model.model_validate(tc.arguments)
@@ -1177,7 +1243,9 @@ class Agent:
         return self._finish_tracked_tool_call(context, tc, result)
 
     async def _execute_single_tool_direct(
-        self, tc: ToolCallComplete
+        self,
+        tc: ToolCallComplete,
+        guard_snapshot: GuardSnapshot | None = None,
     ) -> _ToolExecResult:
         tool = self.registry.get(tc.tool_name)
         start = time.monotonic()
@@ -1246,7 +1314,9 @@ class Agent:
                     is_unknown=False,
                 )
 
-        tracked = await self._execute_validated_tool(tool, tc)
+        tracked = await self._execute_validated_tool(
+            tool, tc, guard_snapshot
+        )
 
         return _ToolExecResult(
             tool_id=tc.tool_id,
@@ -1261,7 +1331,11 @@ class Agent:
     async def _execute_batch_parallel(
         self, calls: list[ToolCallComplete]
     ) -> list[_ToolExecResult]:
-        tasks = [self._execute_single_tool_direct(tc) for tc in calls]
+        guard_snapshot = self.recent_tool_calls.guard_snapshot()
+        tasks = [
+            self._execute_single_tool_direct(tc, guard_snapshot)
+            for tc in calls
+        ]
         return list(await asyncio.gather(*tasks))
 
     async def _execute_tool(
@@ -1275,7 +1349,9 @@ class Agent:
                 yield tracked.result, elapsed, is_unknown
 
     async def _execute_tool_tracked(
-        self, tc: ToolCallComplete
+        self,
+        tc: ToolCallComplete,
+        guard_snapshot: GuardSnapshot | None = None,
     ) -> AsyncIterator[
         PermissionRequest | tuple[TrackedToolResult, float, bool]
     ]:
@@ -1366,7 +1442,9 @@ class Agent:
                     self.permission_checker.rule_engine.append_local_rule(rule)
                     self.permission_checker.add_session_allow(tc.tool_name, content)
 
-        tracked = await self._execute_validated_tool(tool, tc)
+        tracked = await self._execute_validated_tool(
+            tool, tc, guard_snapshot
+        )
 
         elapsed = time.monotonic() - start
         yield tracked, elapsed, is_unknown
@@ -1567,6 +1645,7 @@ class Agent:
             if _new_records:
                 append_replacement_records(self.session_dir, _new_records)
 
+            tool_guard_snapshot = self.recent_tool_calls.guard_snapshot()
             collector = StreamCollector()
             llm_stream = self.recovery_controller.stream(
                 conversation,
@@ -1727,7 +1806,9 @@ class Agent:
                         "toolName": tc.tool_name,
                         "args": tc.arguments,
                     })
-                tracked = await self._execute_tool_noninteractive_tracked(tc)
+                tracked = await self._execute_tool_noninteractive_tracked(
+                    tc, tool_guard_snapshot
+                )
                 result = tracked.result
                 content = self._maybe_persist_or_truncate(
                     tc.tool_id,
@@ -1769,7 +1850,9 @@ class Agent:
         return tracked.result
 
     async def _execute_tool_noninteractive_tracked(
-        self, tc: ToolCallComplete
+        self,
+        tc: ToolCallComplete,
+        guard_snapshot: GuardSnapshot | None = None,
     ) -> TrackedToolResult:
         tool = self.registry.get(tc.tool_name)
 
@@ -1821,7 +1904,9 @@ class Agent:
                         )
                     )
 
-        return await self._execute_validated_tool(tool, tc)
+        return await self._execute_validated_tool(
+            tool, tc, guard_snapshot
+        )
 
     def _maybe_persist_or_truncate(self, tool_use_id: str, text: str) -> str:
         from braincode.context.manager import (

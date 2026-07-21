@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from pydantic import BaseModel
 
-from braincode.tools.base import Tool, ToolDefinition, ToolResult
+from braincode.tools.base import RepeatPolicy, Tool, ToolDefinition, ToolResult
 
 if __import__("typing").TYPE_CHECKING:
     from braincode.tools import ToolRegistry
@@ -28,6 +28,7 @@ class ToolSearchTool(Tool):
     params_model = ToolSearchParams
     category = "read"
     should_defer = False  # ToolSearch 自身永远不延迟加载
+    repeat_policy = RepeatPolicy.GUARD
 
 
     def __init__(

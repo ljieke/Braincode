@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from braincode.tools.recent_calls import (
     RecentToolCallTracker,
     RepeatPolicy,
@@ -138,3 +140,148 @@ def test_active_entries_are_not_evicted_when_capacity_is_full():
     tracker.after_call(second, "two", "same", False)
     assert tracker.in_flight == 0
     assert len(tracker) <= 1
+
+
+def test_guard_blocks_only_the_next_call_after_four_identical_results():
+    tracker = RecentToolCallTracker(guard_after=4)
+    tracker.begin_run()
+
+    decisions = []
+    for index in range(4):
+        context = tracker.before_call(
+            "ReadFile",
+            {"file_path": "a.py"},
+            RepeatPolicy.GUARD,
+        )
+        assert context.blocked is False
+        decisions.append(
+            tracker.after_call(context, f"tool-{index + 1}", "same", False)
+        )
+
+    assert decisions[-1].block_next is True
+    guarded = tracker.before_call(
+        "ReadFile",
+        {"file_path": "a.py"},
+        RepeatPolicy.GUARD,
+    )
+    assert guarded.blocked is True
+    assert guarded.call_number == 5
+    assert guarded.same_result_count == 4
+    assert guarded.last_tool_use_id == "tool-4"
+    assert guarded.policy == RepeatPolicy.GUARD
+    assert tracker.in_flight == 0
+
+    # A guard is deliberately one-shot so a later call can observe changed state.
+    next_call = tracker.before_call(
+        "ReadFile",
+        {"file_path": "a.py"},
+        RepeatPolicy.GUARD,
+    )
+    assert next_call.blocked is False
+    changed = tracker.after_call(next_call, "tool-6", "changed", False)
+    assert changed.same_result_count == 1
+    assert changed.block_next is False
+
+
+@pytest.mark.parametrize("policy", [RepeatPolicy.OBSERVE, RepeatPolicy.WARN])
+def test_non_guard_policies_always_execute(policy: RepeatPolicy):
+    tracker = RecentToolCallTracker(guard_after=2)
+    tracker.begin_run()
+
+    for index in range(6):
+        context = tracker.before_call("Count", {"value": "x"}, policy)
+        assert context.blocked is False
+        decision = tracker.after_call(context, f"tool-{index}", "same", False)
+        assert decision.block_next is False
+
+    assert tracker.in_flight == 0
+
+
+def test_guard_can_be_disabled_without_changing_phase_one_behavior():
+    tracker = RecentToolCallTracker(guard_after=None)
+    tracker.begin_run()
+
+    for index in range(6):
+        context = tracker.before_call(
+            "ReadFile", {"file_path": "a.py"}, RepeatPolicy.GUARD
+        )
+        assert context.blocked is False
+        decision = tracker.after_call(context, f"tool-{index}", "same", False)
+        assert decision.block_next is False
+
+
+def test_argument_change_and_new_run_do_not_inherit_guard():
+    tracker = RecentToolCallTracker(guard_after=2)
+    tracker.begin_run()
+    for index in range(2):
+        context = tracker.before_call(
+            "ReadFile", {"file_path": "a.py"}, RepeatPolicy.GUARD
+        )
+        tracker.after_call(context, f"a-{index}", "same", False)
+
+    changed_arguments = tracker.before_call(
+        "ReadFile", {"file_path": "b.py"}, RepeatPolicy.GUARD
+    )
+    assert changed_arguments.blocked is False
+    tracker.abandon_call(changed_arguments)
+
+    tracker.begin_run()
+    same_arguments_new_run = tracker.before_call(
+        "ReadFile", {"file_path": "a.py"}, RepeatPolicy.GUARD
+    )
+    assert same_arguments_new_run.blocked is False
+    tracker.abandon_call(same_arguments_new_run)
+
+
+def test_unfinished_guard_calls_never_arm_the_guard():
+    tracker = RecentToolCallTracker(guard_after=2)
+    tracker.begin_run()
+    contexts = [
+        tracker.before_call(
+            "ReadFile", {"file_path": "a.py"}, RepeatPolicy.GUARD
+        )
+        for _ in range(5)
+    ]
+
+    assert all(context.blocked is False for context in contexts)
+    assert tracker.in_flight == 5
+    for index, context in enumerate(contexts):
+        tracker.after_call(context, f"tool-{index}", "same", False)
+    assert tracker.in_flight == 0
+
+
+def test_guard_snapshot_is_consumed_once_per_fingerprint():
+    tracker = RecentToolCallTracker(guard_after=2)
+    tracker.begin_run()
+    for index in range(2):
+        context = tracker.before_call(
+            "ReadFile", {"file_path": "a.py"}, RepeatPolicy.GUARD
+        )
+        tracker.after_call(context, f"initial-{index}", "same", False)
+
+    snapshot = tracker.guard_snapshot()
+    guarded = tracker.before_call(
+        "ReadFile",
+        {"file_path": "a.py"},
+        RepeatPolicy.GUARD,
+        snapshot,
+    )
+    assert guarded.blocked is True
+
+    second = tracker.before_call(
+        "ReadFile",
+        {"file_path": "a.py"},
+        RepeatPolicy.GUARD,
+        snapshot,
+    )
+    assert second.blocked is False
+    tracker.after_call(second, "second", "same", False)
+
+    third = tracker.before_call(
+        "ReadFile",
+        {"file_path": "a.py"},
+        RepeatPolicy.GUARD,
+        snapshot,
+    )
+    assert third.blocked is False
+    tracker.after_call(third, "third", "same", False)

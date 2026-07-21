@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
-from braincode.tools.base import Tool, ToolResult
+from braincode.tools.base import RepeatPolicy, Tool, ToolResult
 
 if TYPE_CHECKING:
     from braincode.cache import FileCache
@@ -29,6 +29,7 @@ class ReadFile(Tool):
     params_model = Params
     category = "read"
     is_concurrency_safe = True
+    repeat_policy = RepeatPolicy.GUARD
 
 
     def __init__(self, file_cache: FileCache | None = None, file_state_cache: FileStateCache | None = None) -> None:

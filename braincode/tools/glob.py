@@ -9,7 +9,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from braincode.tools.base import SKIP_DIRS, Tool, ToolResult
+from braincode.tools.base import SKIP_DIRS, RepeatPolicy, Tool, ToolResult
 
 
 class Params(BaseModel):
@@ -23,6 +23,7 @@ class Glob(Tool):
     params_model = Params
     category = "read"
     is_concurrency_safe = True
+    repeat_policy = RepeatPolicy.GUARD
 
 
     async def execute(self, params: Params) -> ToolResult:
@@ -44,4 +45,3 @@ class Glob(Tool):
         if not matches:
             return ToolResult(output="No files matched the pattern.")
         return ToolResult(output="\n".join(matches))
-

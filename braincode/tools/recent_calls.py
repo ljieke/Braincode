@@ -5,12 +5,12 @@ import json
 import logging
 from collections import OrderedDict
 from collections.abc import Mapping
-from dataclasses import dataclass
-from enum import Enum, StrEnum
+from dataclasses import dataclass, field
+from enum import Enum
 from os import PathLike
 from typing import Any
 
-from braincode.tools.base import ToolResult
+from braincode.tools.base import RepeatPolicy, ToolResult
 
 
 log = logging.getLogger(__name__)
@@ -18,12 +18,21 @@ log = logging.getLogger(__name__)
 RECENT_TOOL_CALL_MAX_ENTRIES = 64
 RECENT_TOOL_CALL_COMPACT_AFTER = 2
 RECENT_TOOL_CALL_WARN_AFTER = 3
+RECENT_TOOL_CALL_GUARD_AFTER = 4
 
 
-class RepeatPolicy(StrEnum):
-    OBSERVE = "observe"
-    WARN = "warn"
-    GUARD = "guard"
+@dataclass
+class GuardSnapshot:
+    """Per-response guard eligibility, consumed once per fingerprint."""
+
+    eligible: frozenset[str]
+    consumed: set[str] = field(default_factory=set)
+
+    def consume(self, fingerprint: str) -> bool:
+        if fingerprint not in self.eligible or fingerprint in self.consumed:
+            return False
+        self.consumed.add(fingerprint)
+        return True
 
 
 @dataclass
@@ -37,6 +46,7 @@ class RecentToolCall:
     last_tool_use_id: str | None = None
     in_flight: int = 0
     policy: RepeatPolicy = RepeatPolicy.OBSERVE
+    guard_armed: bool = False
 
 
 @dataclass(frozen=True)
@@ -44,6 +54,10 @@ class CallContext:
     fingerprint: str
     run_id: int
     call_number: int
+    blocked: bool = False
+    same_result_count: int = 0
+    last_tool_use_id: str | None = None
+    policy: RepeatPolicy = RepeatPolicy.OBSERVE
 
 
 @dataclass(frozen=True)
@@ -62,6 +76,7 @@ class TrackedToolResult:
     conversation_output: str
     repeated: bool
     warning: str | None = None
+    guarded: bool = False
 
 
 def _type_name(value: Any) -> str:
@@ -193,6 +208,7 @@ class RecentToolCallTracker:
         max_entries: int = RECENT_TOOL_CALL_MAX_ENTRIES,
         compact_after: int = RECENT_TOOL_CALL_COMPACT_AFTER,
         warn_after: int = RECENT_TOOL_CALL_WARN_AFTER,
+        guard_after: int | None = RECENT_TOOL_CALL_GUARD_AFTER,
     ) -> None:
         if max_entries < 1:
             raise ValueError("max_entries must be at least 1")
@@ -200,9 +216,12 @@ class RecentToolCallTracker:
             raise ValueError("compact_after must be at least 2")
         if warn_after < compact_after:
             raise ValueError("warn_after must be at least compact_after")
+        if guard_after is not None and guard_after < 1:
+            raise ValueError("guard_after must be at least 1 or None")
         self.max_entries = max_entries
         self.compact_after = compact_after
         self.warn_after = warn_after
+        self.guard_after = guard_after
         self._run_id = 0
         self._calls: OrderedDict[str, RecentToolCall] = OrderedDict()
         self._active_calls: set[tuple[int, str, int]] = set()
@@ -229,14 +248,30 @@ class RecentToolCallTracker:
             self._calls.move_to_end(fingerprint)
         return entry
 
+    def guard_snapshot(self) -> GuardSnapshot:
+        """Capture guards armed before a batch starts.
+
+        A completion inside one model response must not newly block a sibling
+        call from that same response.
+        """
+        return GuardSnapshot(
+            frozenset(
+                fingerprint
+                for fingerprint, entry in self._calls.items()
+                if entry.guard_armed
+            )
+        )
+
     def before_call(
         self,
         tool_name: str,
         arguments: dict[str, Any],
         policy: RepeatPolicy,
+        guard_snapshot: GuardSnapshot | None = None,
     ) -> CallContext:
         arguments_json = canonical_arguments_json(arguments)
         fingerprint = tool_call_fingerprint(tool_name, arguments_json)
+        policy = RepeatPolicy(policy)
         entry = self._calls.get(fingerprint)
         if entry is None:
             self._make_room()
@@ -244,20 +279,43 @@ class RecentToolCallTracker:
                 fingerprint=fingerprint,
                 tool_name=tool_name,
                 arguments_json=arguments_json,
-                policy=RepeatPolicy(policy),
+                policy=policy,
             )
             self._calls[fingerprint] = entry
         else:
-            entry.policy = RepeatPolicy(policy)
+            entry.policy = policy
             self._calls.move_to_end(fingerprint)
 
         entry.call_count += 1
+        if policy != RepeatPolicy.GUARD or not entry.guard_armed:
+            guard_visible = False
+        elif guard_snapshot is None:
+            guard_visible = True
+        elif isinstance(guard_snapshot, GuardSnapshot):
+            guard_visible = guard_snapshot.consume(fingerprint)
+        else:
+            # Accept set-like snapshots from older integrations.
+            guard_visible = fingerprint in guard_snapshot
+        blocked = (
+            policy == RepeatPolicy.GUARD
+            and entry.guard_armed
+            and guard_visible
+        )
         entry.in_flight += 1
         context = CallContext(
             fingerprint=fingerprint,
             run_id=self._run_id,
             call_number=entry.call_count,
+            blocked=blocked,
+            same_result_count=entry.same_result_count,
+            last_tool_use_id=entry.last_tool_use_id,
+            policy=policy,
         )
+        if blocked:
+            entry.in_flight -= 1
+            entry.guard_armed = False
+            self._trim_idle()
+            return context
         self._active_calls.add(
             (context.run_id, context.fingerprint, context.call_number)
         )
@@ -270,6 +328,12 @@ class RecentToolCallTracker:
         output: str,
         is_error: bool,
     ) -> RepeatDecision:
+        if context.blocked:
+            return RepeatDecision(
+                repeated=context.same_result_count > 1,
+                same_result_count=context.same_result_count,
+                call_count=context.call_number,
+            )
         active_key = (context.run_id, context.fingerprint, context.call_number)
         if context.run_id != self._run_id or active_key not in self._active_calls:
             return RepeatDecision(repeated=False, same_result_count=0)
@@ -311,6 +375,11 @@ class RecentToolCallTracker:
 
         entry.last_result_hash = result_hash
         entry.last_tool_use_id = tool_use_id
+        entry.guard_armed = (
+            context.policy == RepeatPolicy.GUARD
+            and self.guard_after is not None
+            and entry.same_result_count >= self.guard_after
+        )
         self._calls.move_to_end(context.fingerprint)
         self._trim_idle()
         return RepeatDecision(
@@ -319,7 +388,7 @@ class RecentToolCallTracker:
             call_count=entry.call_count,
             compact_output=compact_output,
             warning=warning,
-            block_next=False,
+            block_next=entry.guard_armed,
         )
 
     def abandon_call(self, context: CallContext) -> None:

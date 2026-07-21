@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel
@@ -15,6 +16,12 @@ SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".tox", ".mypy_cach
 MAX_OUTPUT_CHARS = 10000
 
 ToolCategory = Literal["read", "write", "command"]
+
+
+class RepeatPolicy(StrEnum):
+    OBSERVE = "observe"
+    WARN = "warn"
+    GUARD = "guard"
 
 
 class ToolDefinition(TypedDict):
@@ -39,6 +46,7 @@ class Tool(ABC):
     is_concurrency_safe: bool = False
     is_system_tool: bool = False
     should_defer: bool = False
+    repeat_policy: RepeatPolicy = RepeatPolicy.OBSERVE
 
     @property
     def is_read_only(self) -> bool:

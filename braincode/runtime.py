@@ -94,6 +94,7 @@ class RuntimeEventType(StrEnum):
     HOOK_REJECTED = "hook_rejected"
     TOOL_REPEAT_DETECTED = "tool_repeat_detected"
     TOOL_LOOP_WARNING = "tool_loop_warning"
+    TOOL_LOOP_GUARDED = "tool_loop_guarded"
 
 
 @dataclass(frozen=True)

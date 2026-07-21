@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
-from braincode.tools.base import Tool, ToolResult
+from braincode.tools.base import RepeatPolicy, Tool, ToolResult
 
 if TYPE_CHECKING:
     from braincode.jobs.runners import BackgroundToolRunner
@@ -219,6 +219,7 @@ class Bash(Tool):
     description = "Execute a shell command and return stdout and stderr."
     params_model = Params
     category = "command"
+    repeat_policy = RepeatPolicy.WARN
 
     # 工作目录，为 None 时使用当前进程的工作目录
     work_dir: str | None = None

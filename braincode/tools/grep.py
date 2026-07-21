@@ -10,7 +10,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from braincode.tools.base import SKIP_DIRS, Tool, ToolResult
+from braincode.tools.base import SKIP_DIRS, RepeatPolicy, Tool, ToolResult
 
 
 class Params(BaseModel):
@@ -25,6 +25,7 @@ class Grep(Tool):
     params_model = Params
     category = "read"
     is_concurrency_safe = True
+    repeat_policy = RepeatPolicy.GUARD
 
 
     async def execute(self, params: Params) -> ToolResult:
@@ -59,4 +60,3 @@ class Grep(Tool):
         if not results:
             return ToolResult(output="No matches found.")
         return ToolResult(output="\n".join(results))
-

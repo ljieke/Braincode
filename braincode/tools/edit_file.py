@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
-from braincode.tools.base import Tool, ToolResult
+from braincode.tools.base import RepeatPolicy, Tool, ToolResult
 from braincode.tools.diff import build_diff
 
 if TYPE_CHECKING:
@@ -32,6 +32,7 @@ class EditFile(Tool):
     )
     params_model = Params
     category = "write"
+    repeat_policy = RepeatPolicy.WARN
 
 
     def __init__(self, file_cache: FileCache | None = None, file_history: Any = None, file_state_cache: FileStateCache | None = None) -> None:
