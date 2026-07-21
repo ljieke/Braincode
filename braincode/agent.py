@@ -63,6 +63,12 @@ from braincode.tools.base import (
     ToolCallStart,
     ToolResult,
 )
+from braincode.tools.recent_calls import (
+    CallContext,
+    RecentToolCallTracker,
+    RepeatPolicy,
+    TrackedToolResult,
+)
 
 log = logging.getLogger(__name__)
 
@@ -279,6 +285,7 @@ class _ToolExecResult:
     result: ToolResult
     elapsed: float
     is_unknown: bool
+    conversation_output: str | None = None
 
 
 class StreamingExecutor:
@@ -395,6 +402,9 @@ class Agent:
         self.notification_fn: Callable[[], list[str]] | None = None
         self.file_history: Any = None
         self._hook_prevent_continuation = False
+        self.recent_tool_calls = RecentToolCallTracker()
+        # Keep the explicit class-name alias available for integrations and tests.
+        self.recent_tool_call_tracker = self.recent_tool_calls
 
         # 非阻塞 memory recall：prefetch task 与主 LLM 调用并行，工具执行后注入
         self.memory_recall_task: Any | None = None
@@ -637,6 +647,7 @@ class Agent:
         return tc, decision, None
 
     async def run(self, conversation: ConversationManager) -> AsyncIterator[AgentEvent]:
+        self.recent_tool_calls.begin_run()
         self._current_conversation = conversation
         self._hook_prevent_continuation = False
         user_message = self._latest_user_message(conversation)
@@ -938,8 +949,13 @@ class Agent:
                     consecutive_unknown += 1
                 else:
                     consecutive_unknown = 0
+                conversation_output = (
+                    br.conversation_output
+                    if br.conversation_output is not None
+                    else br.result.output
+                )
                 content = self._maybe_persist_or_truncate(
-                    br.tool_id, br.result.output
+                    br.tool_id, conversation_output
                 )
                 tool_results.append(
                     ToolResultBlock(
@@ -959,25 +975,31 @@ class Agent:
             # 需要交互式权限确认的工具，在流结束后顺序执行
             for tc in deferred_tool_calls:
                 self.recovery_state.tool_execution_started = True
-                result: ToolResult | None = None
+                tracked: TrackedToolResult | None = None
                 elapsed = 0.0
                 is_unknown = False
 
-                async for item in self._execute_tool(tc):
+                async for item in self._execute_tool_tracked(tc):
                     if isinstance(item, PermissionRequest):
                         yield item
                     else:
-                        result, elapsed, is_unknown = item
+                        tracked, elapsed, is_unknown = item
 
-                if result is None:
-                    result = ToolResult(output="Error: no result from tool", is_error=True)
+                if tracked is None:
+                    tracked = self._untracked_tool_result(
+                        ToolResult(output="Error: no result from tool", is_error=True)
+                    )
+                result = tracked.result
 
                 if is_unknown:
                     consecutive_unknown += 1
                 else:
                     consecutive_unknown = 0
 
-                content = self._maybe_persist_or_truncate(tc.tool_id, result.output)
+                content = self._maybe_persist_or_truncate(
+                    tc.tool_id,
+                    tracked.conversation_output,
+                )
                 tool_results.append(
                     ToolResultBlock(
                         tool_use_id=tc.tool_id,
@@ -1054,6 +1076,106 @@ class Agent:
         """为 HITL 权限确认生成人类可读的操作描述。"""
         return PermissionChecker.describe_tool_action(tc.tool_name, tc.arguments)
 
+    def _begin_tracked_tool_call(
+        self,
+        tc: ToolCallComplete,
+        policy: RepeatPolicy = RepeatPolicy.OBSERVE,
+    ) -> CallContext:
+        return self.recent_tool_calls.before_call(
+            tc.tool_name,
+            tc.arguments,
+            policy,
+        )
+
+    def _finish_tracked_tool_call(
+        self,
+        context: CallContext,
+        tc: ToolCallComplete,
+        result: ToolResult,
+    ) -> TrackedToolResult:
+        decision = self.recent_tool_calls.after_call(
+            context,
+            tc.tool_id,
+            result.output,
+            result.is_error,
+        )
+        conversation_output = (
+            decision.warning
+            or decision.compact_output
+            or result.output
+        )
+        if decision.warning:
+            log.warning(
+                "Tool loop detected: agent=%s tool=%s fingerprint=%s "
+                "same_result_count=%d",
+                self.agent_id,
+                tc.tool_name,
+                context.fingerprint,
+                decision.same_result_count,
+            )
+            self._emit_runtime_event(
+                "tool_loop_warning",
+                agent_id=self.agent_id,
+                tool_name=tc.tool_name,
+                fingerprint=context.fingerprint,
+                call_count=decision.call_count,
+                same_result_count=decision.same_result_count,
+                policy=RepeatPolicy.OBSERVE.value,
+            )
+        elif decision.repeated:
+            self._emit_runtime_event(
+                "tool_repeat_detected",
+                agent_id=self.agent_id,
+                tool_name=tc.tool_name,
+                fingerprint=context.fingerprint,
+                call_count=decision.call_count,
+                same_result_count=decision.same_result_count,
+                policy=RepeatPolicy.OBSERVE.value,
+            )
+        return TrackedToolResult(
+            result=result,
+            conversation_output=conversation_output,
+            repeated=decision.repeated,
+            warning=decision.warning,
+        )
+
+    @staticmethod
+    def _untracked_tool_result(result: ToolResult) -> TrackedToolResult:
+        return TrackedToolResult(
+            result=result,
+            conversation_output=result.output,
+            repeated=False,
+        )
+
+    async def _execute_validated_tool(
+        self,
+        tool: Any,
+        tc: ToolCallComplete,
+    ) -> TrackedToolResult:
+        context = self._begin_tracked_tool_call(tc)
+        try:
+            try:
+                params = tool.params_model.model_validate(tc.arguments)
+                result = await tool.execute(params)
+            except ValidationError as e:
+                result = ToolResult(
+                    output=f"Parameter validation error: {e}",
+                    is_error=True,
+                )
+            except Exception as e:
+                result = ToolResult(
+                    output=f"Tool execution error: {e}",
+                    is_error=True,
+                )
+
+            self._snapshot_for_recovery(tc, result)
+            result = await self._apply_post_tool_hooks(tc, result)
+        except BaseException:
+            self.recent_tool_calls.abandon_call(context)
+            raise
+
+        return self._finish_tracked_tool_call(context, tc, result)
+
     async def _execute_single_tool_direct(
         self, tc: ToolCallComplete
     ) -> _ToolExecResult:
@@ -1124,23 +1246,15 @@ class Agent:
                     is_unknown=False,
                 )
 
-        try:
-            params = tool.params_model.model_validate(tc.arguments)
-            result = await tool.execute(params)
-        except ValidationError as e:
-            result = ToolResult(output=f"Parameter validation error: {e}", is_error=True)
-        except Exception as e:
-            result = ToolResult(output=f"Tool execution error: {e}", is_error=True)
-
-        self._snapshot_for_recovery(tc, result)
-        result = await self._apply_post_tool_hooks(tc, result)
+        tracked = await self._execute_validated_tool(tool, tc)
 
         return _ToolExecResult(
             tool_id=tc.tool_id,
             tool_name=tc.tool_name,
-            result=result,
+            result=tracked.result,
             elapsed=time.monotonic() - start,
             is_unknown=False,
+            conversation_output=tracked.conversation_output,
         )
 
 
@@ -1152,7 +1266,19 @@ class Agent:
 
     async def _execute_tool(
         self, tc: ToolCallComplete
-    ) -> AsyncIterator[tuple[ToolResult, float, bool]]:
+    ) -> AsyncIterator[PermissionRequest | tuple[ToolResult, float, bool]]:
+        async for item in self._execute_tool_tracked(tc):
+            if isinstance(item, PermissionRequest):
+                yield item
+            else:
+                tracked, elapsed, is_unknown = item
+                yield tracked.result, elapsed, is_unknown
+
+    async def _execute_tool_tracked(
+        self, tc: ToolCallComplete
+    ) -> AsyncIterator[
+        PermissionRequest | tuple[TrackedToolResult, float, bool]
+    ]:
         tool = self.registry.get(tc.tool_name)
         start = time.monotonic()
         is_unknown = False
@@ -1163,7 +1289,7 @@ class Agent:
             )
             is_unknown = True
             elapsed = time.monotonic() - start
-            yield result, elapsed, is_unknown
+            yield self._untracked_tool_result(result), elapsed, is_unknown
             return
 
         if not self.registry.is_enabled(tc.tool_name):
@@ -1172,12 +1298,16 @@ class Agent:
                 is_error=True,
             )
             elapsed = time.monotonic() - start
-            yield result, elapsed, is_unknown
+            yield self._untracked_tool_result(result), elapsed, is_unknown
             return
 
         tc, hook_error = await self._apply_pre_tool_hooks(tc)
         if hook_error is not None:
-            yield hook_error, time.monotonic() - start, is_unknown
+            yield (
+                self._untracked_tool_result(hook_error),
+                time.monotonic() - start,
+                is_unknown,
+            )
             return
 
         if self.permission_checker:
@@ -1186,14 +1316,22 @@ class Agent:
                 tool, tc, decision
             )
             if permission_error is not None:
-                yield permission_error, time.monotonic() - start, is_unknown
+                yield (
+                    self._untracked_tool_result(permission_error),
+                    time.monotonic() - start,
+                    is_unknown,
+                )
                 return
             if decision.effect == "deny":
                 result = ToolResult(
                     output=f"Permission denied: {decision.reason}",
                     is_error=True,
                 )
-                yield result, time.monotonic() - start, is_unknown
+                yield (
+                    self._untracked_tool_result(result),
+                    time.monotonic() - start,
+                    is_unknown,
+                )
                 return
             if decision.effect == "ask":
                 loop = asyncio.get_running_loop()
@@ -1209,7 +1347,11 @@ class Agent:
                         output="Permission denied: 用户拒绝了此操作",
                         is_error=True,
                     )
-                    yield result, time.monotonic() - start, is_unknown
+                    yield (
+                        self._untracked_tool_result(result),
+                        time.monotonic() - start,
+                        is_unknown,
+                    )
                     return
                 if response == PermissionResponse.ALLOW_ALWAYS:
                     from braincode.permissions.rules import Rule, extract_content
@@ -1224,23 +1366,10 @@ class Agent:
                     self.permission_checker.rule_engine.append_local_rule(rule)
                     self.permission_checker.add_session_allow(tc.tool_name, content)
 
-        try:
-            params = tool.params_model.model_validate(tc.arguments)
-            result = await tool.execute(params)
-        except ValidationError as e:
-            result = ToolResult(
-                output=f"Parameter validation error: {e}", is_error=True
-            )
-        except Exception as e:
-            result = ToolResult(
-                output=f"Tool execution error: {e}", is_error=True
-            )
-
-        self._snapshot_for_recovery(tc, result)
-        result = await self._apply_post_tool_hooks(tc, result)
+        tracked = await self._execute_validated_tool(tool, tc)
 
         elapsed = time.monotonic() - start
-        yield result, elapsed, is_unknown
+        yield tracked, elapsed, is_unknown
 
     def _snapshot_for_recovery(
         self, tc: ToolCallComplete, result: ToolResult
@@ -1333,6 +1462,7 @@ class Agent:
         self, task: str, conversation: ConversationManager | None = None,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
+        self.recent_tool_calls.begin_run()
         env_context = build_environment_context(
             self.work_dir, self.active_skills, "", self._agent_catalog
         )
@@ -1597,8 +1727,12 @@ class Agent:
                         "toolName": tc.tool_name,
                         "args": tc.arguments,
                     })
-                result = await self._execute_tool_noninteractive(tc)
-                content = self._maybe_persist_or_truncate(tc.tool_id, result.output)
+                tracked = await self._execute_tool_noninteractive_tracked(tc)
+                result = tracked.result
+                content = self._maybe_persist_or_truncate(
+                    tc.tool_id,
+                    tracked.conversation_output,
+                )
                 tool_results.append(
                     ToolResultBlock(
                         tool_use_id=tc.tool_id,
@@ -1631,22 +1765,33 @@ class Agent:
     async def _execute_tool_noninteractive(
         self, tc: ToolCallComplete
     ) -> ToolResult:
+        tracked = await self._execute_tool_noninteractive_tracked(tc)
+        return tracked.result
+
+    async def _execute_tool_noninteractive_tracked(
+        self, tc: ToolCallComplete
+    ) -> TrackedToolResult:
         tool = self.registry.get(tc.tool_name)
 
         if tool is None:
-            return ToolResult(
-                output=f"Error: unknown tool '{tc.tool_name}'", is_error=True
+            return self._untracked_tool_result(
+                ToolResult(
+                    output=f"Error: unknown tool '{tc.tool_name}'",
+                    is_error=True,
+                )
             )
 
         if not self.registry.is_enabled(tc.tool_name):
-            return ToolResult(
-                output=f"Error: tool '{tc.tool_name}' is disabled",
-                is_error=True,
+            return self._untracked_tool_result(
+                ToolResult(
+                    output=f"Error: tool '{tc.tool_name}' is disabled",
+                    is_error=True,
+                )
             )
 
         tc, hook_error = await self._apply_pre_tool_hooks(tc)
         if hook_error is not None:
-            return hook_error
+            return self._untracked_tool_result(hook_error)
 
         if self.permission_checker:
             decision = self.permission_checker.check(tool, tc.arguments)
@@ -1654,35 +1799,29 @@ class Agent:
                 tool, tc, decision
             )
             if permission_error is not None:
-                return permission_error
+                return self._untracked_tool_result(permission_error)
             if decision.effect == "deny":
-                return ToolResult(
-                    output=f"Permission denied: {decision.reason}",
-                    is_error=True,
+                return self._untracked_tool_result(
+                    ToolResult(
+                        output=f"Permission denied: {decision.reason}",
+                        is_error=True,
+                    )
                 )
             if decision.effect == "ask":
                 if self.permission_mode == PermissionMode.BYPASS:
                     pass  # BYPASS 模式自动批准
                 else:
-                    return ToolResult(
-                        output="Permission denied: non-interactive agent cannot prompt user",
-                        is_error=True,
+                    return self._untracked_tool_result(
+                        ToolResult(
+                            output=(
+                                "Permission denied: non-interactive agent cannot "
+                                "prompt user"
+                            ),
+                            is_error=True,
+                        )
                     )
 
-        try:
-            params = tool.params_model.model_validate(tc.arguments)
-            result = await tool.execute(params)
-        except ValidationError as e:
-            result = ToolResult(
-                output=f"Parameter validation error: {e}", is_error=True
-            )
-        except Exception as e:
-            result = ToolResult(
-                output=f"Tool execution error: {e}", is_error=True
-            )
-
-        self._snapshot_for_recovery(tc, result)
-        return await self._apply_post_tool_hooks(tc, result)
+        return await self._execute_validated_tool(tool, tc)
 
     def _maybe_persist_or_truncate(self, tool_use_id: str, text: str) -> str:
         from braincode.context.manager import (

@@ -92,6 +92,8 @@ class RuntimeEventType(StrEnum):
     PROVIDER_SWITCHED = "provider_switched"
     HOOK_MODIFIED_INPUT = "hook_modified_input"
     HOOK_REJECTED = "hook_rejected"
+    TOOL_REPEAT_DETECTED = "tool_repeat_detected"
+    TOOL_LOOP_WARNING = "tool_loop_warning"
 
 
 @dataclass(frozen=True)

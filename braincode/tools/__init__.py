@@ -7,6 +7,17 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from braincode.tools.base import Tool, ToolDefinition
+from braincode.tools.recent_calls import (
+    CallContext,
+    RecentToolCall,
+    RecentToolCallTracker,
+    RepeatDecision,
+    RepeatPolicy,
+    TrackedToolResult,
+    canonical_arguments_json,
+    tool_call_fingerprint,
+    tool_result_hash,
+)
 
 if TYPE_CHECKING:
     from braincode.cache import FileCache
